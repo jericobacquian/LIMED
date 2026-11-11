@@ -1,16 +1,20 @@
 package com.example.weight_based_delivery_system
 
-import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.Typeface
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -23,8 +27,11 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -36,6 +43,7 @@ import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Place
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
@@ -43,14 +51,15 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SmallFloatingActionButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
@@ -58,10 +67,11 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -75,12 +85,12 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.graphics.createBitmap
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import com.example.weight_based_delivery_system.data.DeliveryDriver
 import com.example.weight_based_delivery_system.data.DeliveryRepository
 import com.example.weight_based_delivery_system.data.ParcelItem
 import com.example.weight_based_delivery_system.data.VehicleType
 import com.example.weight_based_delivery_system.ui.theme.Weight_based_delivery_systemTheme
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 import org.maplibre.android.MapLibre
 import org.maplibre.android.annotations.IconFactory
 import org.maplibre.android.annotations.Marker
@@ -112,120 +122,246 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun DeliveryDashboard(modifier: Modifier = Modifier) {
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
 
-    // Load 500 dataset items
-    val allParcels = remember { DeliveryRepository.loadData(context) }
+    // Load Drivers
+    val drivers = remember { DeliveryRepository.getDrivers() }
+
+    // State for Daily Dispatch Parcels (Random 350 to 500 items, sorted Heaviest & Farthest First)
+    val dailyDispatchParcels = remember { mutableStateListOf<ParcelItem>() }
+
+    fun refreshDailyDispatch() {
+        dailyDispatchParcels.clear()
+        dailyDispatchParcels.addAll(DeliveryRepository.generateDailyDispatch(context))
+    }
+
+    LaunchedEffect(Unit) {
+        if (dailyDispatchParcels.isEmpty()) {
+            refreshDailyDispatch()
+        }
+    }
+
+    // Pick 1 active parcel per driver for simultaneous dispatch at 6:00 AM
+    val activeParcels = remember(dailyDispatchParcels.size) {
+        mutableStateListOf<ParcelItem>().apply {
+            drivers.forEach { driver ->
+                val assigned = dailyDispatchParcels.firstOrNull { it.assignedDriver.id == driver.id }
+                if (assigned != null) add(assigned)
+            }
+        }
+    }
+
+    // Selected Driver Focus State (Default to Driver 1 - Mark Santos)
+    var selectedDriverId by remember { mutableStateOf(drivers.firstOrNull()?.id ?: "") }
+    val activeSelectedParcel = remember(selectedDriverId, activeParcels) {
+        activeParcels.firstOrNull { it.assignedDriver.id == selectedDriverId }
+    }
+
+    // Central 6:00 AM Dispatch Simulation Clock & Multiplier
+    var simSecondsElapsed by remember { mutableIntStateOf(0) } // Seconds past 06:00 AM
+    var simSpeedMultiplier by remember { mutableIntStateOf(30) } // 30x default fast-forward speed
+    var isPaused by remember { mutableStateOf(false) }
+
+    // UI Panel Toggles for Right Side Vertical Buttons
+    var showClockPanel by remember { mutableStateOf(false) }
+    var showDriverInfoPanel by remember { mutableStateOf(false) }
+    var showBranchInfoPanel by remember { mutableStateOf(false) }
 
     var isBottomSheetOpen by remember { mutableStateOf(false) }
-    var selectedParcel by remember { mutableStateOf<ParcelItem?>(null) }
-    var isSimulatingDelivery by remember { mutableStateOf(false) }
-    var simulationProgress by remember { mutableFloatStateOf(0f) }
+    var detailParcelItem by remember { mutableStateOf<ParcelItem?>(null) }
 
-    // Floating Live Tracking Card state
-    val hubLat = 14.0657415
-    val hubLng = 120.6334763
+    // Central 6:00 AM Simultaneous Dispatch Engine
+    LaunchedEffect(isPaused, simSpeedMultiplier, dailyDispatchParcels.size) {
+        while (!isPaused) {
+            delay(100)
+            simSecondsElapsed += (1 * (simSpeedMultiplier / 10).coerceAtLeast(1))
 
-    val currentSimLat = remember(selectedParcel, simulationProgress) {
-        selectedParcel?.let {
-            hubLat + (it.destinationLat - hubLat) * simulationProgress
-        } ?: hubLat
-    }
+            // Update live progress and coordinates for ALL 5 vehicles along road paths
+            activeParcels.forEach { parcel ->
+                val waypoints = parcel.getRoadWaypoints()
+                val totalDistanceKm = parcel.distanceFromHubKm
+                val speedKmH = parcel.assignedDriver.vehicleType.avgSpeedKmH
+                val totalTravelSeconds = ((totalDistanceKm / speedKmH) * 3600).coerceAtLeast(60.0)
 
-    val currentSimLng = remember(selectedParcel, simulationProgress) {
-        selectedParcel?.let {
-            hubLng + (it.destinationLng - hubLng) * simulationProgress
-        } ?: hubLng
-    }
+                val progress = (simSecondsElapsed / totalTravelSeconds).coerceIn(0.0, 1.0).toFloat()
+                parcel.animationProgress = progress
 
-    // Live Delivery Simulation Loop
-    LaunchedEffect(isSimulatingDelivery, selectedParcel) {
-        if (isSimulatingDelivery && selectedParcel != null) {
-            simulationProgress = 0f
-            while (simulationProgress < 1.0f) {
-                delay(80)
-                simulationProgress += 0.015f
-                if (simulationProgress >= 1.0f) {
-                    simulationProgress = 1.0f
-                    break
-                }
+                // Interpolate vehicle position along road waypoints
+                val currPos = interpolatePath(waypoints, progress.toDouble())
+                parcel.currentLat = currPos.first
+                parcel.currentLng = currPos.second
             }
         }
     }
 
     Box(modifier = modifier.fillMaxSize()) {
-        // Background Map
+        // Lightweight Map View displaying 5 moving vehicles + ONLY selected driver's road route line (NO FLASHING)
         MapLibreView(
             modifier = Modifier.fillMaxSize(),
-            selectedParcel = selectedParcel,
-            simulatedLat = currentSimLat,
-            simulatedLng = currentSimLng,
-            isSimulating = isSimulatingDelivery
+            activeParcels = activeParcels,
+            selectedDriverId = selectedDriverId,
+            simSecondsElapsed = simSecondsElapsed
         )
 
-        // Top Branch Info Overlay
-        if (!isSimulatingDelivery) {
-            BranchInfoCard(
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .padding(16.dp),
-                branchName = "YTO Express Nasugbu Branch",
-                address = "300 J. P. Laurel St, Nasugbu, Batangas",
-                coordinates = "14.0657415, 120.6334763",
-                coverageRadiusKm = 20
-            )
-        } else {
-            // Live Simulation Top Status Bar
-            selectedParcel?.let { parcel ->
-                LiveSimulationCard(
-                    modifier = Modifier
-                        .align(Alignment.TopCenter)
-                        .padding(16.dp),
-                    parcel = parcel,
-                    progress = simulationProgress,
-                    currentLat = currentSimLat,
-                    currentLng = currentSimLng,
-                    onStopSimulation = {
-                        isSimulatingDelivery = false
-                        simulationProgress = 0f
-                    }
+        // Pop-Over Panels (Only appear when user clicks the dedicated right-side buttons)
+        Column(
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .padding(16.dp)
+                .fillMaxWidth(0.8f)
+        ) {
+            AnimatedVisibility(visible = showClockPanel, enter = fadeIn(), exit = fadeOut()) {
+                SimulationClockCard(
+                    simSecondsElapsed = simSecondsElapsed,
+                    speedMultiplier = simSpeedMultiplier,
+                    isPaused = isPaused,
+                    onTogglePause = { isPaused = !isPaused },
+                    onSpeedChange = { newSpeed -> simSpeedMultiplier = newSpeed },
+                    onClose = { showClockPanel = false }
+                )
+            }
+
+            if (showClockPanel && showDriverInfoPanel) Spacer(modifier = Modifier.height(8.dp))
+
+            AnimatedVisibility(visible = showDriverInfoPanel, enter = fadeIn(), exit = fadeOut()) {
+                activeSelectedParcel?.let { parcel ->
+                    ActiveDriverStatusCard(
+                        parcel = parcel,
+                        onClose = { showDriverInfoPanel = false }
+                    )
+                }
+            }
+
+            if ((showClockPanel || showDriverInfoPanel) && showBranchInfoPanel) Spacer(modifier = Modifier.height(8.dp))
+
+            AnimatedVisibility(visible = showBranchInfoPanel, enter = fadeIn(), exit = fadeOut()) {
+                BranchInfoCard(
+                    branchName = "YTO Express Nasugbu Branch",
+                    address = "300 J. P. Laurel St, Nasugbu, Batangas",
+                    coordinates = "14.0657415, 120.6334763",
+                    coverageRadiusKm = 20,
+                    onClose = { showBranchInfoPanel = false }
                 )
             }
         }
 
-        // Floating Action Button to open Parcel Tracker
-        if (!isSimulatingDelivery) {
-            ExtendedFloatingActionButton(
-                onClick = { isBottomSheetOpen = true },
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(bottom = 24.dp),
+        // RIGHT-MOST SIDE VERTICAL BUTTON BAR
+        Column(
+            modifier = Modifier
+                .align(Alignment.CenterEnd)
+                .padding(end = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+            horizontalAlignment = Alignment.End
+        ) {
+            // 0. Refresh / New Delivery Day Button
+            SmallFloatingActionButton(
+                onClick = {
+                    simSecondsElapsed = 0
+                    refreshDailyDispatch()
+                },
+                containerColor = MaterialTheme.colorScheme.tertiaryContainer,
+                contentColor = MaterialTheme.colorScheme.onTertiaryContainer
+            ) {
+                Icon(Icons.Default.Refresh, contentDescription = "New Delivery Day")
+            }
+
+            // 1. Clock Panel Toggle Button
+            SmallFloatingActionButton(
+                onClick = {
+                    showClockPanel = !showClockPanel
+                    if (showClockPanel) {
+                        showDriverInfoPanel = false
+                        showBranchInfoPanel = false
+                    }
+                },
+                containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                contentColor = MaterialTheme.colorScheme.primary
+            ) {
+                Icon(Icons.Default.Info, contentDescription = "Clock Panel")
+            }
+
+            // 2. Active Driver Info Button
+            SmallFloatingActionButton(
+                onClick = {
+                    showDriverInfoPanel = !showDriverInfoPanel
+                    if (showDriverInfoPanel) {
+                        showClockPanel = false
+                        showBranchInfoPanel = false
+                    }
+                },
                 containerColor = MaterialTheme.colorScheme.primaryContainer,
                 contentColor = MaterialTheme.colorScheme.onPrimaryContainer
             ) {
-                Icon(Icons.Default.LocationOn, contentDescription = "Deliveries")
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = "Track 500 Parcels (${allParcels.size})",
-                    fontWeight = FontWeight.Bold
-                )
+                Icon(Icons.Default.Person, contentDescription = "Driver Info")
+            }
+
+            // 3. Nasugbu Branch Hub Info Button
+            SmallFloatingActionButton(
+                onClick = {
+                    showBranchInfoPanel = !showBranchInfoPanel
+                    if (showBranchInfoPanel) {
+                        showClockPanel = false
+                        showDriverInfoPanel = false
+                    }
+                },
+                containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                contentColor = MaterialTheme.colorScheme.onSecondaryContainer
+            ) {
+                Icon(Icons.Default.Place, contentDescription = "Branch Info")
+            }
+
+            // 4. Browse Daily Parcels Catalog Button
+            FloatingActionButton(
+                onClick = { isBottomSheetOpen = true },
+                containerColor = MaterialTheme.colorScheme.primary,
+                contentColor = MaterialTheme.colorScheme.onPrimary
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(Icons.Default.Search, contentDescription = "Browse")
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "Today (${dailyDispatchParcels.size})",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp,
+                        maxLines = 1,
+                        softWrap = false
+                    )
+                }
             }
         }
 
-        // Modal Bottom Sheet for Parcel List & Parcel Details
+        // Bottom Bar: Driver Focus Selector Bar
+        Column(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            DriverSelectorBar(
+                drivers = drivers,
+                selectedDriverId = selectedDriverId,
+                onSelectDriver = { selectedDriverId = it }
+            )
+        }
+
+        // Bottom Sheet: Daily Parcels Catalog
         if (isBottomSheetOpen) {
             ModalBottomSheet(
                 onDismissRequest = { isBottomSheetOpen = false },
                 sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
             ) {
                 ParcelTrackerSheetContent(
-                    parcels = allParcels,
-                    selectedParcel = selectedParcel,
-                    onSelectParcel = { parcel -> selectedParcel = parcel },
-                    onStartSimulation = { parcel ->
-                        selectedParcel = parcel
+                    parcels = dailyDispatchParcels,
+                    selectedParcel = detailParcelItem,
+                    onSelectParcel = { parcel ->
+                        detailParcelItem = parcel
+                    },
+                    onFocusDriverOnMap = { driverId ->
+                        selectedDriverId = driverId
                         isBottomSheetOpen = false
-                        isSimulatingDelivery = true
+                        showDriverInfoPanel = true
                     },
                     onClose = { isBottomSheetOpen = false }
                 )
@@ -240,7 +376,8 @@ fun BranchInfoCard(
     branchName: String,
     address: String,
     coordinates: String,
-    coverageRadiusKm: Int
+    coverageRadiusKm: Int,
+    onClose: () -> Unit
 ) {
     Card(
         modifier = modifier.fillMaxWidth(),
@@ -251,83 +388,8 @@ fun BranchInfoCard(
         elevation = CardDefaults.cardElevation(defaultElevation = 6.dp)
     ) {
         Column(
-            modifier = Modifier.padding(16.dp)
+            modifier = Modifier.padding(14.dp)
         ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Icon(
-                    imageVector = Icons.Default.LocationOn,
-                    contentDescription = "Location",
-                    tint = MaterialTheme.colorScheme.primary
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = branchName,
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onSurface
-                )
-            }
-
-            Spacer(modifier = Modifier.height(4.dp))
-
-            Text(
-                text = address,
-                fontSize = 13.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-
-            Text(
-                text = "Coordinates: $coordinates",
-                fontSize = 12.sp,
-                color = MaterialTheme.colorScheme.outline
-            )
-
-            Spacer(modifier = Modifier.height(8.dp))
-
-            Row(
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Info,
-                    contentDescription = "Coverage Barrier",
-                    tint = MaterialTheme.colorScheme.secondary
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = "Delivery Coverage: $coverageRadiusKm km Radius Barrier",
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = MaterialTheme.colorScheme.secondary
-                )
-            }
-        }
-    }
-}
-
-@Composable
-fun LiveSimulationCard(
-    modifier: Modifier = Modifier,
-    parcel: ParcelItem,
-    progress: Float,
-    currentLat: Double,
-    currentLng: Double,
-    onStopSimulation: () -> Unit
-) {
-    val remainingDistance = (1.0f - progress) * parcel.distanceFromHubKm
-    val speed = parcel.assignedDriver.vehicleType.avgSpeedKmH
-    val remainingEtaMins = kotlin.math.max(0, ((remainingDistance / speed) * 60).toInt())
-
-    Card(
-        modifier = modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.primaryContainer
-        ),
-        elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
-    ) {
-        Column(modifier = Modifier.padding(16.dp)) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -336,55 +398,292 @@ fun LiveSimulationCard(
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(
                         imageVector = Icons.Default.LocationOn,
-                        contentDescription = "Vehicle",
-                        tint = MaterialTheme.colorScheme.onPrimaryContainer
+                        contentDescription = "Location",
+                        tint = MaterialTheme.colorScheme.primary
                     )
-                    Spacer(modifier = Modifier.width(8.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = if (progress >= 1.0f) "DELIVERED!" else "EN ROUTE TO CUSTOMER",
+                        text = branchName,
+                        fontSize = 15.sp,
                         fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onPrimaryContainer,
-                        fontSize = 15.sp
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                        softWrap = false
                     )
                 }
-
-                IconButton(onClick = onStopSimulation) {
-                    Icon(Icons.Default.Close, contentDescription = "Stop")
+                IconButton(onClick = onClose, modifier = Modifier.size(24.dp)) {
+                    Icon(Icons.Default.Close, contentDescription = "Close", tint = MaterialTheme.colorScheme.outline)
                 }
             }
 
             Spacer(modifier = Modifier.height(4.dp))
 
             Text(
-                text = "${parcel.name} (${parcel.weightKg} kg)",
-                fontWeight = FontWeight.SemiBold,
-                fontSize = 14.sp,
-                color = MaterialTheme.colorScheme.onPrimaryContainer
+                text = address,
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
             Text(
-                text = "Assigned Driver: ${parcel.assignedDriver.name} (${parcel.assignedDriver.vehicleName})",
-                fontSize = 12.sp,
-                color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f)
+                text = "Coordinates: $coordinates",
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.outline
             )
 
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(6.dp))
+
+            Row(
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Info,
+                    contentDescription = "Coverage Barrier",
+                    tint = MaterialTheme.colorScheme.secondary,
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = "Delivery Coverage: $coverageRadiusKm km Radius Barrier",
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = MaterialTheme.colorScheme.secondary,
+                    maxLines = 1,
+                    softWrap = false
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun SimulationClockCard(
+    simSecondsElapsed: Int,
+    speedMultiplier: Int,
+    isPaused: Boolean,
+    onTogglePause: () -> Unit,
+    onSpeedChange: (Int) -> Unit,
+    onClose: () -> Unit
+) {
+    val totalMins = simSecondsElapsed / 60
+    val hours = 6 + (totalMins / 60)
+    val mins = totalMins % 60
+    val clockStr = "%02d:%02d AM".format(if (hours > 12) hours - 12 else hours, mins)
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 6.dp)
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text(
+                        text = "🌅 DISPATCH SHIFT CLOCK",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Text(
+                        text = clockStr,
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
+
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = onTogglePause) {
+                        Icon(
+                            imageVector = if (isPaused) Icons.Default.PlayArrow else Icons.Default.Close,
+                            contentDescription = "Pause",
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                    IconButton(onClick = onClose, modifier = Modifier.size(24.dp)) {
+                        Icon(Icons.Default.Close, contentDescription = "Close", tint = MaterialTheme.colorScheme.outline)
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
+
+            // Speed Multiplier Chips in a horizontal scrollable row
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                listOf(10, 30, 60).forEach { speed ->
+                    FilterChip(
+                        selected = speedMultiplier == speed,
+                        onClick = { onSpeedChange(speed) },
+                        label = { Text("${speed}x", fontSize = 11.sp, maxLines = 1, softWrap = false) }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun ActiveDriverStatusCard(
+    parcel: ParcelItem,
+    onClose: () -> Unit
+) {
+    val remainingKm = parcel.remainingDistanceKm
+    val speed = parcel.assignedDriver.vehicleType.avgSpeedKmH
+    val remainingEtaMins = kotlin.math.max(0, ((remainingKm / speed) * 60).toInt())
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.primaryContainer
+        ),
+        elevation = CardDefaults.cardElevation(defaultElevation = 6.dp)
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    modifier = Modifier.weight(1f),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.LocationOn,
+                        contentDescription = "Driver",
+                        tint = MaterialTheme.colorScheme.onPrimaryContainer
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "${parcel.assignedDriver.name} (${parcel.assignedDriver.vehicleName})",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                        maxLines = 1,
+                        softWrap = false
+                    )
+                }
+
+                Surface(
+                    color = MaterialTheme.colorScheme.primary,
+                    shape = RoundedCornerShape(6.dp),
+                    modifier = Modifier.wrapContentWidth()
+                ) {
+                    Text(
+                        text = parcel.assignedDriver.vehicleType.name,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onPrimary,
+                        maxLines = 1,
+                        softWrap = false,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                }
+
+                Spacer(modifier = Modifier.width(6.dp))
+
+                IconButton(onClick = onClose, modifier = Modifier.size(24.dp)) {
+                    Icon(Icons.Default.Close, contentDescription = "Close", tint = MaterialTheme.colorScheme.onPrimaryContainer)
+                }
+            }
+
+            Spacer(modifier = Modifier.height(4.dp))
+
+            Text(
+                text = "📦 Parcel: ${parcel.name} (${parcel.weightKg} kg)",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                maxLines = 1,
+                softWrap = false
+            )
+
+            Text(
+                text = "📍 Dest: ${parcel.destinationAddress}",
+                fontSize = 11.sp,
+                color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f),
+                maxLines = 1,
+                softWrap = false
+            )
+
+            Spacer(modifier = Modifier.height(4.dp))
+
+            Surface(
+                color = MaterialTheme.colorScheme.secondaryContainer,
+                shape = RoundedCornerShape(4.dp)
+            ) {
+                Text(
+                    text = "⚖️ Priority Order: Heaviest & Farthest First",
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                )
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 Text(
-                    text = "Distance: %.2f km".format(remainingDistance),
-                    fontSize = 13.sp,
+                    text = "Distance: %.2f km".format(remainingKm),
+                    fontSize = 11.sp,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.onPrimaryContainer
                 )
                 Text(
-                    text = "ETA: $remainingEtaMins mins",
-                    fontSize = 13.sp,
+                    text = if (parcel.animationProgress >= 1.0f) "✅ DELIVERED!" else "⏱️ ETA: $remainingEtaMins mins",
+                    fontSize = 11.sp,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.onPrimaryContainer
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun DriverSelectorBar(
+    drivers: List<DeliveryDriver>,
+    selectedDriverId: String,
+    onSelectDriver: (String) -> Unit
+) {
+    Surface(
+        shape = RoundedCornerShape(24.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        shadowElevation = 6.dp
+    ) {
+        LazyRow(
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            items(drivers) { driver ->
+                FilterChip(
+                    selected = selectedDriverId == driver.id,
+                    onClick = { onSelectDriver(driver.id) },
+                    label = {
+                        Text(
+                            text = "${driver.name} (${driver.vehicleType.name})",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            softWrap = false
+                        )
+                    }
                 )
             }
         }
@@ -396,7 +695,7 @@ fun ParcelTrackerSheetContent(
     parcels: List<ParcelItem>,
     selectedParcel: ParcelItem?,
     onSelectParcel: (ParcelItem) -> Unit,
-    onStartSimulation: (ParcelItem) -> Unit,
+    onFocusDriverOnMap: (String) -> Unit,
     onClose: () -> Unit
 ) {
     var searchQuery by remember { mutableStateOf("") }
@@ -425,7 +724,9 @@ fun ParcelTrackerSheetContent(
             ParcelDetailView(
                 parcel = currentDetailItem!!,
                 onBack = { currentDetailItem = null },
-                onStartSimulation = { onStartSimulation(currentDetailItem!!) }
+                onFocusDriverOnMap = {
+                    onFocusDriverOnMap(currentDetailItem!!.assignedDriver.id)
+                }
             )
         } else {
             // List View & Filters
@@ -435,9 +736,11 @@ fun ParcelTrackerSheetContent(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "Parcel Dispatch Catalog (${filteredParcels.size})",
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.Bold
+                    text = "Daily Dispatch Catalog (${filteredParcels.size} Parcels)",
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    softWrap = false
                 )
                 IconButton(onClick = onClose) {
                     Icon(Icons.Default.Close, contentDescription = "Close")
@@ -458,30 +761,32 @@ fun ParcelTrackerSheetContent(
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            // Vehicle Type Filter Chips
+            // Vehicle Type Filter Chips in a horizontal scrollable row to prevent vertical wrapping
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 FilterChip(
                     selected = selectedVehicleFilter == null,
                     onClick = { selectedVehicleFilter = null },
-                    label = { Text("All (500)") }
+                    label = { Text("All (${parcels.size})", maxLines = 1, softWrap = false) }
                 )
                 FilterChip(
                     selected = selectedVehicleFilter == VehicleType.MOTORCYCLE,
                     onClick = { selectedVehicleFilter = VehicleType.MOTORCYCLE },
-                    label = { Text("🏍️ Motorcycle") }
+                    label = { Text("🏍️ Motorcycle", maxLines = 1, softWrap = false) }
                 )
                 FilterChip(
                     selected = selectedVehicleFilter == VehicleType.L300,
                     onClick = { selectedVehicleFilter = VehicleType.L300 },
-                    label = { Text("🚐 L300") }
+                    label = { Text("🚐 L300", maxLines = 1, softWrap = false) }
                 )
                 FilterChip(
                     selected = selectedVehicleFilter == VehicleType.TRUCK,
                     onClick = { selectedVehicleFilter = VehicleType.TRUCK },
-                    label = { Text("🚚 Truck") }
+                    label = { Text("🚚 Truck", maxLines = 1, softWrap = false) }
                 )
             }
 
@@ -551,23 +856,29 @@ fun ParcelItemCard(
             Column(modifier = Modifier.weight(1f)) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
                         text = parcel.name,
                         fontWeight = FontWeight.Bold,
                         fontSize = 14.sp,
-                        maxLines = 1
+                        maxLines = 1,
+                        modifier = Modifier.weight(1f)
                     )
+                    Spacer(modifier = Modifier.width(6.dp))
                     Surface(
                         color = MaterialTheme.colorScheme.primary,
-                        shape = RoundedCornerShape(6.dp)
+                        shape = RoundedCornerShape(6.dp),
+                        modifier = Modifier.wrapContentWidth()
                     ) {
                         Text(
                             text = "${parcel.weightKg} kg",
                             color = MaterialTheme.colorScheme.onPrimary,
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            softWrap = false,
                             modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                         )
                     }
@@ -578,7 +889,8 @@ fun ParcelItemCard(
                 Text(
                     text = "Brand: ${parcel.brand} | Driver: ${parcel.assignedDriver.name}",
                     fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1
                 )
 
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -593,7 +905,9 @@ fun ParcelItemCard(
                         text = if (parcel.isWithin20KmCoverage) "Inside 20km Zone (%.1f km)".format(parcel.distanceFromHubKm)
                         else "Outside 20km Zone (%.1f km)".format(parcel.distanceFromHubKm),
                         fontSize = 11.sp,
-                        color = if (parcel.isWithin20KmCoverage) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
+                        color = if (parcel.isWithin20KmCoverage) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
+                        maxLines = 1,
+                        softWrap = false
                     )
                 }
             }
@@ -605,7 +919,7 @@ fun ParcelItemCard(
 fun ParcelDetailView(
     parcel: ParcelItem,
     onBack: () -> Unit,
-    onStartSimulation: () -> Unit
+    onFocusDriverOnMap: () -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -725,7 +1039,7 @@ fun ParcelDetailView(
         Spacer(modifier = Modifier.height(16.dp))
 
         Button(
-            onClick = onStartSimulation,
+            onClick = onFocusDriverOnMap,
             modifier = Modifier
                 .fillMaxWidth()
                 .height(50.dp),
@@ -734,10 +1048,10 @@ fun ParcelDetailView(
                 containerColor = MaterialTheme.colorScheme.primary
             )
         ) {
-            Icon(Icons.Default.PlayArrow, contentDescription = "Simulate")
+            Icon(Icons.Default.LocationOn, contentDescription = "Focus Driver")
             Spacer(modifier = Modifier.width(8.dp))
             Text(
-                text = "Simulate Delivery on Map",
+                text = "Focus Driver Route on Map",
                 fontWeight = FontWeight.Bold,
                 fontSize = 15.sp
             )
@@ -748,10 +1062,9 @@ fun ParcelDetailView(
 @Composable
 fun MapLibreView(
     modifier: Modifier = Modifier,
-    selectedParcel: ParcelItem?,
-    simulatedLat: Double,
-    simulatedLng: Double,
-    isSimulating: Boolean
+    activeParcels: List<ParcelItem>,
+    selectedDriverId: String,
+    simSecondsElapsed: Int
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -761,8 +1074,7 @@ fun MapLibreView(
 
     var mapInstance by remember { mutableStateOf<MapLibreMap?>(null) }
     var routePolyline by remember { mutableStateOf<Polyline?>(null) }
-    var vehicleMarker by remember { mutableStateOf<Marker?>(null) }
-    var destMarker by remember { mutableStateOf<Marker?>(null) }
+    val vehicleMarkers = remember { mutableStateMapOf<String, Marker>() }
 
     val mapView = remember {
         MapView(context).apply {
@@ -797,52 +1109,54 @@ fun MapLibreView(
         }
     }
 
-    // Dynamic Route & Moving Vehicle Marker update during Simulation
-    LaunchedEffect(selectedParcel, simulatedLat, simulatedLng, isSimulating) {
+    // 1. NON-FLASHING Route Polyline update (ONLY re-runs when selectedDriverId changes)
+    LaunchedEffect(selectedDriverId, activeParcels.size) {
         val map = mapInstance ?: return@LaunchedEffect
-        val parcel = selectedParcel ?: return@LaunchedEffect
+        val selectedParcel = activeParcels.firstOrNull { it.assignedDriver.id == selectedDriverId } ?: return@LaunchedEffect
 
-        val destPoint = LatLng(parcel.destinationLat, parcel.destinationLng)
-        val simPoint = LatLng(simulatedLat, simulatedLng)
-
-        // Clear previous route / markers
+        // Remove previous route line and add thin, solid blue road line
         routePolyline?.remove()
-        destMarker?.remove()
-        vehicleMarker?.remove()
+        val waypoints = selectedParcel.getRoadWaypoints().map { LatLng(it.first, it.second) }
+        val routeOptions = PolylineOptions()
+            .addAll(waypoints)
+            .color(Color.parseColor("#1976D2")) // Solid Vibrant Blue Road Line
+            .width(3.0f) // Thin line width
+        routePolyline = map.addPolyline(routeOptions)
+    }
 
-        if (isSimulating || selectedParcel != null) {
-            // Draw Route Polyline from Hub to Customer Destination
-            val routeOptions = PolylineOptions()
-                .add(pickupCenterLocation, destPoint)
-                .color(Color.parseColor("#43A047")) // Vibrant Green Route Line
-                .width(5.0f)
-            routePolyline = map.addPolyline(routeOptions)
+    // 2. Live Marker Position Updates (Updates vehicle positions on every tick without re-creating route polyline!)
+    LaunchedEffect(simSecondsElapsed) {
+        val map = mapInstance ?: return@LaunchedEffect
 
-            // Destination Marker
-            destMarker = map.addMarker(
-                MarkerOptions()
-                    .position(destPoint)
-                    .title("Customer: ${parcel.customerName}")
-                    .snippet(parcel.destinationAddress)
-            )
+        activeParcels.forEach { parcel ->
+            val driverId = parcel.assignedDriver.id
+            val currPoint = LatLng(parcel.currentLat, parcel.currentLng)
 
-            // Moving Vehicle Marker
-            val vehicleBitmap = createVehicleMarkerBitmap(context, parcel.assignedDriver.vehicleType)
-            val vehicleIcon = IconFactory.getInstance(context).fromBitmap(vehicleBitmap)
+            val existingMarker = vehicleMarkers[driverId]
+            if (existingMarker != null) {
+                existingMarker.position = currPoint
+            } else {
+                val vehicleBitmap = createVehicleMarkerBitmap(parcel.assignedDriver.vehicleType)
+                val vehicleIcon = IconFactory.getInstance(context).fromBitmap(vehicleBitmap)
+                val newMarker = map.addMarker(
+                    MarkerOptions()
+                        .position(currPoint)
+                        .icon(vehicleIcon)
+                        .title("Driver: ${parcel.assignedDriver.name}")
+                        .snippet("${parcel.assignedDriver.vehicleName} (${parcel.assignedDriver.licensePlate})")
+                )
+                if (newMarker != null) {
+                    vehicleMarkers[driverId] = newMarker
+                }
+            }
 
-            vehicleMarker = map.addMarker(
-                MarkerOptions()
-                    .position(simPoint)
-                    .icon(vehicleIcon)
-                    .title("Driver: ${parcel.assignedDriver.name}")
-                    .snippet("En Route (${parcel.assignedDriver.vehicleName})")
-            )
-
-            // Focus map camera on vehicle & route
-            map.animateCamera(
-                CameraUpdateFactory.newLatLngZoom(simPoint, 11.5),
-                500
-            )
+            // Smooth camera follow for active driver
+            if (driverId == selectedDriverId) {
+                map.animateCamera(
+                    CameraUpdateFactory.newLatLngZoom(currPoint, 11.2),
+                    300
+                )
+            }
         }
     }
 
@@ -882,6 +1196,28 @@ fun MapLibreView(
         factory = { mapView },
         modifier = modifier.fillMaxSize()
     )
+}
+
+/**
+ * Interpolates position along a list of waypoints based on progress (0.0 to 1.0).
+ */
+private fun interpolatePath(waypoints: List<Pair<Double, Double>>, progress: Double): Pair<Double, Double> {
+    if (waypoints.isEmpty()) return 14.0657415 to 120.6334763
+    if (waypoints.size == 1 || progress <= 0.0) return waypoints.first()
+    if (progress >= 1.0) return waypoints.last()
+
+    val totalSegments = waypoints.size - 1
+    val scaledProgress = progress * totalSegments
+    val segmentIndex = scaledProgress.toInt().coerceIn(0, totalSegments - 1)
+    val segmentProgress = scaledProgress - segmentIndex
+
+    val p1 = waypoints[segmentIndex]
+    val p2 = waypoints[segmentIndex + 1]
+
+    val lat = p1.first + (p2.first - p1.first) * segmentProgress
+    val lng = p1.second + (p2.second - p1.second) * segmentProgress
+
+    return lat to lng
 }
 
 /**
@@ -948,16 +1284,16 @@ private fun createCustomMarkerBitmap(): Bitmap {
 /**
  * Creates custom vehicle marker bitmaps based on vehicle type (Motorcycle, L300, Truck).
  */
-private fun createVehicleMarkerBitmap(context: Context, vehicleType: VehicleType): Bitmap {
-    val width = 80
-    val height = 80
+private fun createVehicleMarkerBitmap(vehicleType: VehicleType): Bitmap {
+    val width = 84
+    val height = 84
     val bitmap = createBitmap(width, height)
     val canvas = Canvas(bitmap)
 
     val colorHex = when (vehicleType) {
-        VehicleType.MOTORCYCLE -> "#FF6D00" // Orange for Motorcycle
-        VehicleType.L300 -> "#2979FF"       // Blue for L300
-        VehicleType.TRUCK -> "#6A1B9A"      // Purple for Heavy Truck
+        VehicleType.MOTORCYCLE -> "#FF6D00" // Vibrant Orange for Motorcycle 🏍️
+        VehicleType.L300 -> "#2979FF"       // Vibrant Blue for L300 🚐
+        VehicleType.TRUCK -> "#9C27B0"      // Vibrant Purple for Heavy Truck 🚚
     }
 
     val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -965,14 +1301,34 @@ private fun createVehicleMarkerBitmap(context: Context, vehicleType: VehicleType
         style = Paint.Style.FILL
     }
 
-    // Outer Circle
-    canvas.drawCircle(width / 2f, height / 2f, 36f, paint)
+    // Outer Circle Shadow/Border
+    val centerX = width / 2f
+    val centerY = height / 2f
+    canvas.drawCircle(centerX, centerY, 38f, paint)
 
     // Inner White Ring
     paint.color = Color.WHITE
     paint.style = Paint.Style.STROKE
-    paint.strokeWidth = 4f
-    canvas.drawCircle(width / 2f, height / 2f, 34f, paint)
+    paint.strokeWidth = 5f
+    canvas.drawCircle(centerX, centerY, 35f, paint)
+
+    // Inner Solid Circle
+    paint.style = Paint.Style.FILL
+    paint.color = Color.parseColor(colorHex)
+    canvas.drawCircle(centerX, centerY, 28f, paint)
+
+    // Center Vehicle Symbol Text
+    paint.color = Color.WHITE
+    paint.textSize = 22f
+    paint.textAlign = Paint.Align.CENTER
+    paint.typeface = Typeface.DEFAULT_BOLD
+    val symbolStr = when (vehicleType) {
+        VehicleType.MOTORCYCLE -> "MC"
+        VehicleType.L300 -> "VAN"
+        VehicleType.TRUCK -> "TRK"
+    }
+    val yPos = centerY - ((paint.descent() + paint.ascent()) / 2)
+    canvas.drawText(symbolStr, centerX, yPos, paint)
 
     return bitmap
 }
