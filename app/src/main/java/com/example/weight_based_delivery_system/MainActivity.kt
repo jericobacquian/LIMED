@@ -8,6 +8,8 @@ import android.graphics.Path
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.os.Bundle
+import android.util.Log
+import android.util.LruCache
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.animation.AnimatedVisibility
@@ -93,10 +95,15 @@ import com.example.weight_based_delivery_system.data.DeliveryDriver
 import com.example.weight_based_delivery_system.data.DeliveryRepository
 import com.example.weight_based_delivery_system.data.DeliveryStatus
 import com.example.weight_based_delivery_system.data.DriverShiftState
+import com.example.weight_based_delivery_system.data.OsrmConfig
+import com.example.weight_based_delivery_system.data.OsrmRoutingService
 import com.example.weight_based_delivery_system.data.ParcelItem
+import com.example.weight_based_delivery_system.data.RiderState
+import com.example.weight_based_delivery_system.data.RouteCacheManager
+import com.example.weight_based_delivery_system.data.RouteFetchStatus
 import com.example.weight_based_delivery_system.data.VehicleType
 import com.example.weight_based_delivery_system.data.calculateDistanceKm
-import com.example.weight_based_delivery_system.data.generateRoadRoutePoints
+import com.example.weight_based_delivery_system.data.interpolateAlongRoute
 import com.example.weight_based_delivery_system.ui.theme.Weight_based_delivery_systemTheme
 import kotlinx.coroutines.delay
 import org.maplibre.android.MapLibre
@@ -110,11 +117,17 @@ import org.maplibre.android.geometry.LatLng
 import org.maplibre.android.maps.MapLibreMap
 import org.maplibre.android.maps.MapView
 
+private var activeSimLoopCount = 0
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         // Initialize MapLibre before rendering UI
         MapLibre.getInstance(this)
+
+        if (OsrmConfig.CLEAR_CACHE_ON_START) {
+            RouteCacheManager.clear()
+        }
 
         setContent {
             Weight_based_delivery_systemTheme {
@@ -189,100 +202,178 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
     var isBottomSheetOpen by remember { mutableStateOf(false) }
     var detailParcelItem by remember { mutableStateOf<ParcelItem?>(null) }
 
-    // Central 6:00 AM Real-World Simulation Engine (Speed + Unloading Delays + Traffic + Return Trip to Hub)
-    LaunchedEffect(isPaused, simSpeedMultiplier, dailyDispatchParcels.size) {
-        while (!isPaused) {
-            delay(100)
-            val stepSeconds = (1 * (simSpeedMultiplier / 10).coerceAtLeast(1))
-            simSecondsElapsed += stepSeconds
+    // Asynchronously fetch OSRM turn-by-turn road routes for each rider's active leg
+    driverShiftStates.forEach { shiftState ->
+        val parcel = shiftState.currentParcel
+        val destLat = parcel?.destinationLat ?: hubLat
+        val destLng = parcel?.destinationLng ?: hubLng
+        val legName = if (parcel != null) "Stop #${shiftState.currentParcelIndex + 1} (${parcel.name})" else "Return to Hub"
 
-            // Traffic Factor: 25% speed reduction during 07:30 AM - 09:00 AM Rush Hour
-            val trafficFactor = if (simSecondsElapsed in 5400..10800) 0.75 else 1.0
+        LaunchedEffect(shiftState.driver.id, shiftState.currentParcelIndex, shiftState.riderState) {
+            if (shiftState.riderState == RiderState.EN_ROUTE || shiftState.riderState == RiderState.RETURNING) {
+                shiftState.routeStatus = RouteFetchStatus.LOADING
+                val result = OsrmRoutingService.fetchRoute(
+                    driverName = shiftState.driver.name,
+                    legName = legName,
+                    startLat = shiftState.legStartLat,
+                    startLng = shiftState.legStartLng,
+                    destLat = destLat,
+                    destLng = destLng,
+                    vehicleType = shiftState.driver.vehicleType
+                )
 
-            driverShiftStates.forEach { shiftState ->
-                val parcel = shiftState.currentParcel
-
-                if (parcel != null) {
-                    // 1. DELIVERING PARCELS IN QUEUE
-                    if (shiftState.isUnloading) {
-                        // Unloading / Customer Handover Delay at destination
-                        shiftState.unloadingSecondsRemaining -= (stepSeconds * (simSpeedMultiplier / 10).coerceAtLeast(1))
-                        if (shiftState.unloadingSecondsRemaining <= 0) {
-                            parcel.status = DeliveryStatus.DELIVERED
-                            shiftState.isUnloading = false
-                            shiftState.legStartLat = parcel.destinationLat
-                            shiftState.legStartLng = parcel.destinationLng
-                            shiftState.legSecondsElapsed = 0.0
-                            shiftState.currentParcelIndex += 1
-                        }
-                    } else {
-                        // Travelling to destination
-                        parcel.status = DeliveryStatus.IN_TRANSIT
-
-                        val waypoints = generateRoadRoutePoints(
-                            startLat = shiftState.legStartLat,
-                            startLng = shiftState.legStartLng,
-                            destLat = parcel.destinationLat,
-                            destLng = parcel.destinationLng
-                        )
-
-                        val legDistanceKm = calculateDistanceKm(
-                            shiftState.legStartLat, shiftState.legStartLng,
-                            parcel.destinationLat, parcel.destinationLng
-                        )
-                        val effectiveSpeedKmH = shiftState.driver.vehicleType.avgSpeedKmH * trafficFactor
-                        val totalLegSeconds = ((legDistanceKm / effectiveSpeedKmH) * 3600).coerceAtLeast(20.0)
-
-                        shiftState.legSecondsElapsed += stepSeconds // Fixed: applied once
-                        val progress = (shiftState.legSecondsElapsed / totalLegSeconds).coerceIn(0.0, 1.0)
-                        parcel.animationProgress = progress.toFloat()
-
-                        val currPos = interpolatePath(waypoints, progress)
-                        shiftState.currentLat = currPos.first
-                        shiftState.currentLng = currPos.second
-                        parcel.currentLat = currPos.first
-                        parcel.currentLng = currPos.second
-
-                        // Arrived at customer destination -> Start Unloading Delay!
-                        if (progress >= 1.0) {
-                            shiftState.isUnloading = true
-                            shiftState.unloadingSecondsRemaining = parcel.unloadingDurationSeconds
-                        }
-                    }
-                } else if (!shiftState.isShiftFullyCompleted) {
-                    // 2. RETURN TRIP TO NASUGBU HUB AFTER SHIFT
-                    if (!shiftState.isReturningToHub) {
-                        shiftState.isReturningToHub = true
-                        shiftState.legSecondsElapsed = 0.0
-                    }
-
-                    val waypoints = generateRoadRoutePoints(
-                        startLat = shiftState.legStartLat,
-                        startLng = shiftState.legStartLng,
-                        destLat = hubLat,
-                        destLng = hubLng
-                    )
-
-                    val legDistanceKm = calculateDistanceKm(
-                        shiftState.legStartLat, shiftState.legStartLng,
-                        hubLat, hubLng
-                    )
-                    val effectiveSpeedKmH = shiftState.driver.vehicleType.avgSpeedKmH * trafficFactor
-                    val totalLegSeconds = ((legDistanceKm / effectiveSpeedKmH) * 3600).coerceAtLeast(20.0)
-
-                    shiftState.legSecondsElapsed += stepSeconds
-                    val progress = (shiftState.legSecondsElapsed / totalLegSeconds).coerceIn(0.0, 1.0)
-
-                    val currPos = interpolatePath(waypoints, progress)
-                    shiftState.currentLat = currPos.first
-                    shiftState.currentLng = currPos.second
-
-                    if (progress >= 1.0) {
-                        shiftState.isReturningToHub = false
-                        shiftState.isShiftFullyCompleted = true
-                    }
+                if (result.isSuccess) {
+                    shiftState.currentRoute = result.getOrNull()
+                    shiftState.routeStatus = RouteFetchStatus.READY
+                } else {
+                    shiftState.routeStatus = RouteFetchStatus.UNAVAILABLE
                 }
             }
+        }
+    }
+
+    // Central 6:00 AM Real-World Simulation Engine (Speed + Unloading Delays + Traffic + Return Trip to Hub)
+    LaunchedEffect(isPaused, simSpeedMultiplier, dailyDispatchParcels.size) {
+        activeSimLoopCount++
+        Log.d("SimEngine", "Started simulation loop. Active loop count: $activeSimLoopCount")
+
+        try {
+            while (!isPaused) {
+                delay(100)
+                val stepSeconds = (1 * (simSpeedMultiplier / 10).coerceAtLeast(1))
+                simSecondsElapsed += stepSeconds
+
+                // Traffic Factor: 25% speed reduction during 07:30 AM - 09:00 AM Rush Hour
+                val trafficFactor = if (simSecondsElapsed in 5400..10800) 0.75 else 1.0
+
+                driverShiftStates.forEach { shiftState ->
+                    val parcel = shiftState.currentParcel
+
+                    when (shiftState.riderState) {
+                        RiderState.AT_HUB -> {
+                            shiftState.currentLat = hubLat
+                            shiftState.currentLng = hubLng
+                            if (parcel != null) {
+                                shiftState.riderState = RiderState.EN_ROUTE
+                                shiftState.legStartLat = hubLat
+                                shiftState.legStartLng = hubLng
+                                shiftState.legSecondsElapsed = 0.0
+                            }
+                        }
+
+                        RiderState.EN_ROUTE -> {
+                            if (parcel != null) {
+                                parcel.status = DeliveryStatus.IN_TRANSIT
+
+                                val route = shiftState.currentRoute
+                                if (shiftState.routeStatus == RouteFetchStatus.READY && route != null) {
+                                    val effectiveSpeedKmH = shiftState.driver.vehicleType.avgSpeedKmH * trafficFactor
+                                    val speedMetersPerSec = (effectiveSpeedKmH * 1000.0) / 3600.0
+
+                                    shiftState.legSecondsElapsed += stepSeconds
+                                    val distMeters = shiftState.legSecondsElapsed * speedMetersPerSec
+
+                                    val currPos = interpolateAlongRoute(route, distMeters)
+                                    shiftState.currentLat = currPos.latitude
+                                    shiftState.currentLng = currPos.longitude
+                                    parcel.currentLat = currPos.latitude
+                                    parcel.currentLng = currPos.longitude
+
+                                    if (distMeters >= route.totalDistanceMeters) {
+                                        // Arrived at destination -> Pin position and transition to UNLOADING
+                                        shiftState.currentLat = parcel.destinationLat
+                                        shiftState.currentLng = parcel.destinationLng
+                                        parcel.currentLat = parcel.destinationLat
+                                        parcel.currentLng = parcel.destinationLng
+                                        shiftState.riderState = RiderState.UNLOADING
+                                        shiftState.unloadingSecondsRemaining = parcel.unloadingDurationSeconds
+                                    }
+                                } else {
+                                    // Route is loading or unavailable -> Stay stationary at leg start!
+                                    shiftState.currentLat = shiftState.legStartLat
+                                    shiftState.currentLng = shiftState.legStartLng
+                                    parcel.currentLat = shiftState.legStartLat
+                                    parcel.currentLng = shiftState.legStartLng
+                                }
+                            } else {
+                                shiftState.riderState = RiderState.RETURNING
+                                shiftState.legSecondsElapsed = 0.0
+                            }
+                        }
+
+                        RiderState.UNLOADING -> {
+                            if (parcel != null) {
+                                // Position MUST stay strictly pinned during unloading
+                                shiftState.currentLat = parcel.destinationLat
+                                shiftState.currentLng = parcel.destinationLng
+                                parcel.currentLat = parcel.destinationLat
+                                parcel.currentLng = parcel.destinationLng
+
+                                shiftState.unloadingSecondsRemaining -= (stepSeconds * (simSpeedMultiplier / 10).coerceAtLeast(1))
+                                if (shiftState.unloadingSecondsRemaining <= 0) {
+                                    parcel.status = DeliveryStatus.DELIVERED
+
+                                    // Store previous stop's coordinates as legStartLat/Lng for next leg
+                                    shiftState.legStartLat = parcel.destinationLat
+                                    shiftState.legStartLng = parcel.destinationLng
+                                    shiftState.legSecondsElapsed = 0.0
+                                    shiftState.currentParcelIndex += 1
+
+                                    if (shiftState.currentParcel != null) {
+                                        shiftState.riderState = RiderState.EN_ROUTE
+                                    } else {
+                                        shiftState.riderState = RiderState.RETURNING
+                                    }
+                                }
+                            } else {
+                                shiftState.riderState = RiderState.RETURNING
+                                shiftState.legSecondsElapsed = 0.0
+                            }
+                        }
+
+                        RiderState.RETURNING -> {
+                            val route = shiftState.currentRoute
+                            if (shiftState.routeStatus == RouteFetchStatus.READY && route != null) {
+                                val effectiveSpeedKmH = shiftState.driver.vehicleType.avgSpeedKmH * trafficFactor
+                                val speedMetersPerSec = (effectiveSpeedKmH * 1000.0) / 3600.0
+
+                                shiftState.legSecondsElapsed += stepSeconds
+                                val distMeters = shiftState.legSecondsElapsed * speedMetersPerSec
+
+                                val currPos = interpolateAlongRoute(route, distMeters)
+                                shiftState.currentLat = currPos.latitude
+                                shiftState.currentLng = currPos.longitude
+
+                                if (distMeters >= route.totalDistanceMeters) {
+                                    shiftState.currentLat = hubLat
+                                    shiftState.currentLng = hubLng
+                                    shiftState.riderState = RiderState.SHIFT_COMPLETED
+                                }
+                            } else {
+                                shiftState.currentLat = shiftState.legStartLat
+                                shiftState.currentLng = shiftState.legStartLng
+                            }
+                        }
+
+                        RiderState.SHIFT_COMPLETED -> {
+                            shiftState.currentLat = hubLat
+                            shiftState.currentLng = hubLng
+                        }
+                    }
+                }
+
+                // Check if ALL drivers have completed their shift!
+                val allCompleted = driverShiftStates.isNotEmpty() && driverShiftStates.all {
+                    it.riderState == RiderState.SHIFT_COMPLETED
+                }
+                if (allCompleted) {
+                    isPaused = true
+                    Log.d("SimEngine", "🎉 ALL SHIFTS COMPLETE! All 5 Riders Returned to Base. Simulation engine auto-paused.")
+                }
+            }
+        } finally {
+            activeSimLoopCount--
+            Log.d("SimEngine", "Stopped simulation loop. Remaining active loop count: $activeSimLoopCount")
         }
     }
 
@@ -327,7 +418,6 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
                 activeSelectedShift?.let { shift ->
                     ActiveDriverStatusCard(
                         shiftState = shift,
-                        isRushHour = isRushHour,
                         onClose = { showDriverInfoPanel = false }
                     )
                 }
@@ -650,7 +740,6 @@ fun BranchInfoCard(
 @Composable
 fun ActiveDriverStatusCard(
     shiftState: DriverShiftState,
-    isRushHour: Boolean,
     onClose: () -> Unit
 ) {
     val parcel = shiftState.currentParcel
@@ -718,7 +807,35 @@ fun ActiveDriverStatusCard(
 
             Spacer(modifier = Modifier.height(6.dp))
 
-            if (shiftState.isUnloading && parcel != null) {
+            if (shiftState.routeStatus == RouteFetchStatus.LOADING) {
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = "⏳ Fetching OSRM Turn-by-Turn Road Route...",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(8.dp)
+                    )
+                }
+            } else if (shiftState.routeStatus == RouteFetchStatus.UNAVAILABLE) {
+                Surface(
+                    color = MaterialTheme.colorScheme.errorContainer,
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = "⚠️ Route Unavailable - Retrying with Backoff...",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                        modifier = Modifier.padding(8.dp)
+                    )
+                }
+            } else if (shiftState.isUnloading && parcel != null) {
                 // 📦 Unloading Delay Banner
                 Surface(
                     color = MaterialTheme.colorScheme.tertiaryContainer,
@@ -1327,6 +1444,11 @@ fun MapLibreView(
     var targetDestMarker by remember { mutableStateOf<Marker?>(null) }
     val vehicleMarkers = remember { mutableStateMapOf<String, Marker>() }
 
+    // Memory Tracker & LRU Cache for Callout Bitmaps
+    val calloutBitmapCache = remember { LruCache<String, Bitmap>(30) }
+    val lastCalloutTextMap = remember { mutableMapOf<String, String>() }
+    val lastCamPos = remember { mutableStateOf<LatLng?>(null) }
+
     val mapView = remember {
         MapView(context).apply {
             onCreate(null)
@@ -1365,7 +1487,7 @@ fun MapLibreView(
     val currentSelectedParcelId = activeShift?.currentParcel?.id ?: "RETURN_HUB"
 
     // 1. Active Leg Route Line & Target Destination Marker Updates
-    LaunchedEffect(selectedDriverId, currentSelectedParcelId, activeShift?.isReturningToHub) {
+    LaunchedEffect(selectedDriverId, currentSelectedParcelId, activeShift?.isReturningToHub, activeShift?.routeStatus) {
         val map = mapInstance ?: return@LaunchedEffect
         val shift = activeShift ?: return@LaunchedEffect
 
@@ -1384,44 +1506,41 @@ fun MapLibreView(
                     .snippet("${parcel.name} (${parcel.weightKg} kg)")
             )
 
-            val waypoints = parcel.getRoadWaypoints(
-                startLat = shift.legStartLat,
-                startLng = shift.legStartLng
-            ).map { LatLng(it.first, it.second) }
-
-            val routeOptions = PolylineOptions()
-                .addAll(waypoints)
-                .color(Color.parseColor("#1976D2")) // Solid Vibrant Blue Road Line
-                .width(3.0f)
-            routePolyline = map.addPolyline(routeOptions)
+            if (shift.routeStatus == RouteFetchStatus.READY && shift.currentRoute != null) {
+                val routeOptions = PolylineOptions()
+                    .addAll(shift.currentRoute!!.points)
+                    .color(Color.parseColor("#1976D2")) // Solid Vibrant Blue OSRM Road Polyline
+                    .width(3.0f)
+                routePolyline = map.addPolyline(routeOptions)
+            }
         } else if (shift.isReturningToHub) {
             // Return leg to Nasugbu Hub
-            val waypoints = generateRoadRoutePoints(
-                startLat = shift.legStartLat,
-                startLng = shift.legStartLng,
-                destLat = 14.0657415,
-                destLng = 120.6334763
-            ).map { LatLng(it.first, it.second) }
-
-            val routeOptions = PolylineOptions()
-                .addAll(waypoints)
-                .color(Color.parseColor("#1976D2"))
-                .width(3.0f)
-            routePolyline = map.addPolyline(routeOptions)
+            if (shift.routeStatus == RouteFetchStatus.READY && shift.currentRoute != null) {
+                val routeOptions = PolylineOptions()
+                    .addAll(shift.currentRoute!!.points)
+                    .color(Color.parseColor("#1976D2"))
+                    .width(3.0f)
+                routePolyline = map.addPolyline(routeOptions)
+            }
         }
 
-        // Camera focus for active driver
-        if (shift.currentLat != 14.0657415 || shift.currentLng != 120.6334763) {
+        // Camera focus for active driver (only if position changed and shift not completed)
+        val activePos = LatLng(shift.currentLat, shift.currentLng)
+        if (!shift.isShiftFullyCompleted && lastCamPos.value != activePos) {
+            lastCamPos.value = activePos
             map.animateCamera(
-                CameraUpdateFactory.newLatLngZoom(LatLng(shift.currentLat, shift.currentLng), 11.2),
-                600
+                CameraUpdateFactory.newLatLngZoom(activePos, 11.2),
+                300
             )
         }
     }
 
-    // 2. Live Marker Position & Dynamic Callout Updates (Updates vehicle positions + moving callouts)
+    // 2. Live Marker Position & Cached Callout Updates
     LaunchedEffect(simSecondsElapsed) {
         val map = mapInstance ?: return@LaunchedEffect
+
+        val runtime = Runtime.getRuntime()
+        val usedHeapMB = (runtime.totalMemory() - runtime.freeMemory()) / (1024 * 1024)
 
         driverShiftStates.forEach { shiftState ->
             val driverId = shiftState.driver.id
@@ -1429,6 +1548,8 @@ fun MapLibreView(
             val parcel = shiftState.currentParcel
 
             val calloutTitle = when {
+                shiftState.routeStatus == RouteFetchStatus.LOADING -> "Loading OSRM Route..."
+                shiftState.routeStatus == RouteFetchStatus.UNAVAILABLE -> "Route Unavailable"
                 shiftState.isUnloading && parcel != null -> "Unloading at ${parcel.customerName}"
                 shiftState.isReturningToHub -> "Returning to Nasugbu Hub"
                 shiftState.isShiftFullyCompleted -> "Shift Completed"
@@ -1436,6 +1557,8 @@ fun MapLibreView(
                 else -> "Idle"
             }
             val calloutSubtitle = when {
+                shiftState.routeStatus == RouteFetchStatus.LOADING -> "Please wait"
+                shiftState.routeStatus == RouteFetchStatus.UNAVAILABLE -> "Retrying..."
                 shiftState.isUnloading && parcel != null -> "Handover in progress"
                 shiftState.isReturningToHub -> "Hub Base"
                 shiftState.isShiftFullyCompleted -> "Nasugbu Hub"
@@ -1443,29 +1566,45 @@ fun MapLibreView(
                 else -> "YTO Express"
             }
 
-            val vehicleBitmap = createVehicleCalloutMarkerBitmap(
-                vehicleType = shiftState.driver.vehicleType,
-                driverName = shiftState.driver.name,
-                parcelName = calloutTitle,
-                destAddress = calloutSubtitle
-            )
-            val vehicleIcon = IconFactory.getInstance(context).fromBitmap(vehicleBitmap)
+            val newCalloutText = "$calloutTitle|$calloutSubtitle"
+            val previousText = lastCalloutTextMap[driverId]
 
-            val existingMarker = vehicleMarkers[driverId]
-            if (existingMarker != null) {
-                existingMarker.position = currPoint
-                existingMarker.setIcon(vehicleIcon)
-            } else {
-                val newMarker = map.addMarker(
-                    MarkerOptions()
-                        .position(currPoint)
-                        .icon(vehicleIcon)
-                        .title("Driver: ${shiftState.driver.name}")
-                        .snippet("$calloutTitle -> $calloutSubtitle")
-                )
-                if (newMarker != null) {
-                    vehicleMarkers[driverId] = newMarker
+            // ONLY regenerate or update Bitmap icon if the text content actually CHANGED!
+            if (previousText != newCalloutText || !vehicleMarkers.containsKey(driverId)) {
+                lastCalloutTextMap[driverId] = newCalloutText
+
+                var cachedBitmap = calloutBitmapCache.get(newCalloutText)
+                if (cachedBitmap == null || cachedBitmap.isRecycled) {
+                    cachedBitmap = createVehicleCalloutMarkerBitmap(
+                        vehicleType = shiftState.driver.vehicleType,
+                        driverName = shiftState.driver.name,
+                        parcelName = calloutTitle,
+                        destAddress = calloutSubtitle
+                    )
+                    calloutBitmapCache.put(newCalloutText, cachedBitmap)
+                    Log.d("MemoryTracker", "Created NEW Bitmap for $driverId: '$newCalloutText' | Heap Used: $usedHeapMB MB")
                 }
+
+                val vehicleIcon = IconFactory.getInstance(context).fromBitmap(cachedBitmap)
+                val existingMarker = vehicleMarkers[driverId]
+                if (existingMarker != null) {
+                    existingMarker.position = currPoint
+                    existingMarker.setIcon(vehicleIcon)
+                } else {
+                    val newMarker = map.addMarker(
+                        MarkerOptions()
+                            .position(currPoint)
+                            .icon(vehicleIcon)
+                            .title("Driver: ${shiftState.driver.name}")
+                            .snippet("$calloutTitle -> $calloutSubtitle")
+                    )
+                    if (newMarker != null) {
+                        vehicleMarkers[driverId] = newMarker
+                    }
+                }
+            } else {
+                // Content unchanged: simply update marker position without recreating Bitmap!
+                vehicleMarkers[driverId]?.position = currPoint
             }
         }
     }
@@ -1478,7 +1617,10 @@ fun MapLibreView(
                 Lifecycle.Event.ON_RESUME -> mapView.onResume()
                 Lifecycle.Event.ON_PAUSE -> mapView.onPause()
                 Lifecycle.Event.ON_STOP -> mapView.onStop()
-                Lifecycle.Event.ON_DESTROY -> mapView.onDestroy()
+                Lifecycle.Event.ON_DESTROY -> {
+                    mapView.onDestroy()
+                    calloutBitmapCache.evictAll()
+                }
                 else -> {}
             }
         }
@@ -1498,6 +1640,7 @@ fun MapLibreView(
             mapView.onPause()
             mapView.onStop()
             mapView.onDestroy()
+            calloutBitmapCache.evictAll()
         }
     }
 
@@ -1506,28 +1649,6 @@ fun MapLibreView(
         factory = { mapView },
         modifier = modifier.fillMaxSize()
     )
-}
-
-/**
- * Interpolates position along a list of waypoints based on progress (0.0 to 1.0).
- */
-private fun interpolatePath(waypoints: List<Pair<Double, Double>>, progress: Double): Pair<Double, Double> {
-    if (waypoints.isEmpty()) return 14.0657415 to 120.6334763
-    if (waypoints.size == 1 || progress <= 0.0) return waypoints.first()
-    if (progress >= 1.0) return waypoints.last()
-
-    val totalSegments = waypoints.size - 1
-    val scaledProgress = progress * totalSegments
-    val segmentIndex = scaledProgress.toInt().coerceIn(0, totalSegments - 1)
-    val segmentProgress = scaledProgress - segmentIndex
-
-    val p1 = waypoints[segmentIndex]
-    val p2 = waypoints[segmentIndex + 1]
-
-    val lat = p1.first + (p2.first - p1.first) * segmentProgress
-    val lng = p1.second + (p2.second - p1.second) * segmentProgress
-
-    return lat to lng
 }
 
 /**
