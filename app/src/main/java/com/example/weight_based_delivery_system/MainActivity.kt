@@ -5,6 +5,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -13,6 +14,7 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -129,6 +131,9 @@ class MainActivity : ComponentActivity() {
 fun DeliveryDashboard(modifier: Modifier = Modifier) {
     val context = LocalContext.current
 
+    val hubLat = 14.0657415
+    val hubLng = 120.6334763
+
     // State for Daily Dispatch Parcels (Random 350 to 500 items, sorted Heaviest & Farthest First)
     val dailyDispatchParcels = remember { mutableStateListOf<ParcelItem>() }
 
@@ -172,59 +177,109 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
     var simSpeedMultiplier by remember { mutableIntStateOf(30) } // 30x default fast-forward speed
     var isPaused by remember { mutableStateOf(false) }
 
+    // Rush Hour Traffic Indicator (07:30 AM - 09:00 AM)
+    val isRushHour = remember(simSecondsElapsed) {
+        simSecondsElapsed in 5400..10800 // 07:30 AM to 09:00 AM
+    }
+
     // UI Panel Toggles for Right Side Vertical Buttons
-    var showClockPanel by remember { mutableStateOf(false) }
     var showDriverInfoPanel by remember { mutableStateOf(false) }
     var showBranchInfoPanel by remember { mutableStateOf(false) }
 
     var isBottomSheetOpen by remember { mutableStateOf(false) }
     var detailParcelItem by remember { mutableStateOf<ParcelItem?>(null) }
 
-    // Central 6:00 AM Multi-Parcel Sequential Dispatch Simulation Engine
+    // Central 6:00 AM Real-World Simulation Engine (Speed + Unloading Delays + Traffic + Return Trip to Hub)
     LaunchedEffect(isPaused, simSpeedMultiplier, dailyDispatchParcels.size) {
         while (!isPaused) {
             delay(100)
             val stepSeconds = (1 * (simSpeedMultiplier / 10).coerceAtLeast(1))
             simSecondsElapsed += stepSeconds
 
-            // Update movement across full parcel queues for ALL 5 drivers concurrently
+            // Traffic Factor: 25% speed reduction during 07:30 AM - 09:00 AM Rush Hour
+            val trafficFactor = if (simSecondsElapsed in 5400..10800) 0.75 else 1.0
+
             driverShiftStates.forEach { shiftState ->
                 val parcel = shiftState.currentParcel
+
                 if (parcel != null) {
-                    parcel.status = DeliveryStatus.IN_TRANSIT
+                    // 1. DELIVERING PARCELS IN QUEUE
+                    if (shiftState.isUnloading) {
+                        // Unloading / Customer Handover Delay at destination
+                        shiftState.unloadingSecondsRemaining -= (stepSeconds * (simSpeedMultiplier / 10).coerceAtLeast(1))
+                        if (shiftState.unloadingSecondsRemaining <= 0) {
+                            parcel.status = DeliveryStatus.DELIVERED
+                            shiftState.isUnloading = false
+                            shiftState.legStartLat = parcel.destinationLat
+                            shiftState.legStartLng = parcel.destinationLng
+                            shiftState.legSecondsElapsed = 0.0
+                            shiftState.currentParcelIndex += 1
+                        }
+                    } else {
+                        // Travelling to destination
+                        parcel.status = DeliveryStatus.IN_TRANSIT
+
+                        val waypoints = generateRoadRoutePoints(
+                            startLat = shiftState.legStartLat,
+                            startLng = shiftState.legStartLng,
+                            destLat = parcel.destinationLat,
+                            destLng = parcel.destinationLng
+                        )
+
+                        val legDistanceKm = calculateDistanceKm(
+                            shiftState.legStartLat, shiftState.legStartLng,
+                            parcel.destinationLat, parcel.destinationLng
+                        )
+                        val effectiveSpeedKmH = shiftState.driver.vehicleType.avgSpeedKmH * trafficFactor
+                        val totalLegSeconds = ((legDistanceKm / effectiveSpeedKmH) * 3600).coerceAtLeast(20.0)
+
+                        shiftState.legSecondsElapsed += stepSeconds // Fixed: applied once
+                        val progress = (shiftState.legSecondsElapsed / totalLegSeconds).coerceIn(0.0, 1.0)
+                        parcel.animationProgress = progress.toFloat()
+
+                        val currPos = interpolatePath(waypoints, progress)
+                        shiftState.currentLat = currPos.first
+                        shiftState.currentLng = currPos.second
+                        parcel.currentLat = currPos.first
+                        parcel.currentLng = currPos.second
+
+                        // Arrived at customer destination -> Start Unloading Delay!
+                        if (progress >= 1.0) {
+                            shiftState.isUnloading = true
+                            shiftState.unloadingSecondsRemaining = parcel.unloadingDurationSeconds
+                        }
+                    }
+                } else if (!shiftState.isShiftFullyCompleted) {
+                    // 2. RETURN TRIP TO NASUGBU HUB AFTER SHIFT
+                    if (!shiftState.isReturningToHub) {
+                        shiftState.isReturningToHub = true
+                        shiftState.legSecondsElapsed = 0.0
+                    }
 
                     val waypoints = generateRoadRoutePoints(
                         startLat = shiftState.legStartLat,
                         startLng = shiftState.legStartLng,
-                        destLat = parcel.destinationLat,
-                        destLng = parcel.destinationLng
+                        destLat = hubLat,
+                        destLng = hubLng
                     )
 
                     val legDistanceKm = calculateDistanceKm(
                         shiftState.legStartLat, shiftState.legStartLng,
-                        parcel.destinationLat, parcel.destinationLng
+                        hubLat, hubLng
                     )
-                    val speedKmH = shiftState.driver.vehicleType.avgSpeedKmH
-                    val totalLegSeconds = ((legDistanceKm / speedKmH) * 3600).coerceAtLeast(30.0)
+                    val effectiveSpeedKmH = shiftState.driver.vehicleType.avgSpeedKmH * trafficFactor
+                    val totalLegSeconds = ((legDistanceKm / effectiveSpeedKmH) * 3600).coerceAtLeast(20.0)
 
                     shiftState.legSecondsElapsed += stepSeconds
                     val progress = (shiftState.legSecondsElapsed / totalLegSeconds).coerceIn(0.0, 1.0)
-                    parcel.animationProgress = progress.toFloat()
 
-                    // Interpolate current vehicle coordinates along road path
                     val currPos = interpolatePath(waypoints, progress)
                     shiftState.currentLat = currPos.first
                     shiftState.currentLng = currPos.second
-                    parcel.currentLat = currPos.first
-                    parcel.currentLng = currPos.second
 
-                    // When arrived at stop, mark DELIVERED and advance automatically to next parcel in queue!
                     if (progress >= 1.0) {
-                        parcel.status = DeliveryStatus.DELIVERED
-                        shiftState.legStartLat = parcel.destinationLat
-                        shiftState.legStartLng = parcel.destinationLng
-                        shiftState.legSecondsElapsed = 0.0
-                        shiftState.currentParcelIndex += 1
+                        shiftState.isReturningToHub = false
+                        shiftState.isShiftFullyCompleted = true
                     }
                 }
             }
@@ -240,36 +295,45 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
             simSecondsElapsed = simSecondsElapsed
         )
 
+        // 🌅 SLEEK INTEGRATED TOP FLOATING HEADER PILL BAR
+        SleekHeaderPillBar(
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .padding(top = 16.dp, start = 16.dp, end = 16.dp),
+            simSecondsElapsed = simSecondsElapsed,
+            speedMultiplier = simSpeedMultiplier,
+            isPaused = isPaused,
+            isRushHour = isRushHour,
+            activeShift = activeSelectedShift,
+            onTogglePause = { isPaused = !isPaused },
+            onCycleSpeed = {
+                simSpeedMultiplier = when (simSpeedMultiplier) {
+                    1 -> 10
+                    10 -> 30
+                    30 -> 60
+                    else -> 1
+                }
+            }
+        )
+
         // Pop-Over Panels (Only appear when user clicks the dedicated right-side buttons)
         Column(
             modifier = Modifier
                 .align(Alignment.TopStart)
-                .padding(16.dp)
+                .padding(top = 80.dp, start = 16.dp)
                 .fillMaxWidth(0.85f)
         ) {
-            AnimatedVisibility(visible = showClockPanel, enter = fadeIn(), exit = fadeOut()) {
-                SimulationClockCard(
-                    simSecondsElapsed = simSecondsElapsed,
-                    speedMultiplier = simSpeedMultiplier,
-                    isPaused = isPaused,
-                    onTogglePause = { isPaused = !isPaused },
-                    onSpeedChange = { newSpeed -> simSpeedMultiplier = newSpeed },
-                    onClose = { showClockPanel = false }
-                )
-            }
-
-            if (showClockPanel && showDriverInfoPanel) Spacer(modifier = Modifier.height(8.dp))
-
             AnimatedVisibility(visible = showDriverInfoPanel, enter = fadeIn(), exit = fadeOut()) {
                 activeSelectedShift?.let { shift ->
                     ActiveDriverStatusCard(
                         shiftState = shift,
+                        isRushHour = isRushHour,
                         onClose = { showDriverInfoPanel = false }
                     )
                 }
             }
 
-            if ((showClockPanel || showDriverInfoPanel) && showBranchInfoPanel) Spacer(modifier = Modifier.height(8.dp))
+            if (showDriverInfoPanel && showBranchInfoPanel) Spacer(modifier = Modifier.height(8.dp))
 
             AnimatedVisibility(visible = showBranchInfoPanel, enter = fadeIn(), exit = fadeOut()) {
                 BranchInfoCard(
@@ -282,7 +346,7 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
             }
         }
 
-        // RIGHT-MOST SIDE VERTICAL BUTTON BAR
+        // RIGHT-MOST SIDE VERTICAL FLOATING ACTION BUTTON BAR
         Column(
             modifier = Modifier
                 .align(Alignment.CenterEnd)
@@ -290,7 +354,7 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
             verticalArrangement = Arrangement.spacedBy(12.dp),
             horizontalAlignment = Alignment.End
         ) {
-            // 0. Refresh / New Delivery Day Button
+            // 1. Refresh / New Delivery Day Button
             SmallFloatingActionButton(
                 onClick = {
                     simSecondsElapsed = 0
@@ -302,27 +366,11 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
                 Icon(Icons.Default.Refresh, contentDescription = "New Delivery Day")
             }
 
-            // 1. Clock Panel Toggle Button
-            SmallFloatingActionButton(
-                onClick = {
-                    showClockPanel = !showClockPanel
-                    if (showClockPanel) {
-                        showDriverInfoPanel = false
-                        showBranchInfoPanel = false
-                    }
-                },
-                containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-                contentColor = MaterialTheme.colorScheme.primary
-            ) {
-                Icon(Icons.Default.Info, contentDescription = "Clock Panel")
-            }
-
-            // 2. Active Driver Info Button
+            // 2. Active Driver Info Panel Button
             SmallFloatingActionButton(
                 onClick = {
                     showDriverInfoPanel = !showDriverInfoPanel
                     if (showDriverInfoPanel) {
-                        showClockPanel = false
                         showBranchInfoPanel = false
                     }
                 },
@@ -337,7 +385,6 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
                 onClick = {
                     showBranchInfoPanel = !showBranchInfoPanel
                     if (showBranchInfoPanel) {
-                        showClockPanel = false
                         showDriverInfoPanel = false
                     }
                 },
@@ -360,7 +407,7 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
                     Icon(Icons.Default.Search, contentDescription = "Browse")
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = "Today (${dailyDispatchParcels.size})",
+                        text = "Parcels (${dailyDispatchParcels.size})",
                         fontWeight = FontWeight.Bold,
                         fontSize = 13.sp,
                         maxLines = 1,
@@ -403,6 +450,113 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
                     },
                     onClose = { isBottomSheetOpen = false }
                 )
+            }
+        }
+    }
+}
+
+@Composable
+fun SleekHeaderPillBar(
+    modifier: Modifier = Modifier,
+    simSecondsElapsed: Int,
+    speedMultiplier: Int,
+    isPaused: Boolean,
+    isRushHour: Boolean,
+    activeShift: DriverShiftState?,
+    onTogglePause: () -> Unit,
+    onCycleSpeed: () -> Unit
+) {
+    val totalMins = simSecondsElapsed / 60
+    val hours = 6 + (totalMins / 60)
+    val mins = totalMins % 60
+    val clockStr = "%02d:%02d AM".format(if (hours > 12) hours - 12 else hours, mins)
+
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(24.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.95f),
+        shadowElevation = 6.dp
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // Clock & Traffic Badge
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = "🌅 $clockStr",
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                if (isRushHour) {
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Surface(
+                        color = MaterialTheme.colorScheme.errorContainer,
+                        shape = RoundedCornerShape(4.dp)
+                    ) {
+                        Text(
+                            text = "🚦 Rush Hour",
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
+                        )
+                    }
+                }
+            }
+
+            // Active Driver Name
+            activeShift?.let { shift ->
+                Text(
+                    text = "🚚 ${shift.driver.name}",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.primary,
+                    maxLines = 1,
+                    softWrap = false
+                )
+            }
+
+            // Speed & Play Controls
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Surface(
+                    color = MaterialTheme.colorScheme.primaryContainer,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.clickable { onCycleSpeed() }
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Info,
+                            contentDescription = "Speed",
+                            tint = MaterialTheme.colorScheme.onPrimaryContainer,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "${speedMultiplier}x",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.width(4.dp))
+
+                IconButton(onClick = onTogglePause, modifier = Modifier.size(28.dp)) {
+                    Icon(
+                        imageVector = if (isPaused) Icons.Default.PlayArrow else Icons.Default.Close,
+                        contentDescription = "Pause",
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                }
             }
         }
     }
@@ -494,86 +648,9 @@ fun BranchInfoCard(
 }
 
 @Composable
-fun SimulationClockCard(
-    simSecondsElapsed: Int,
-    speedMultiplier: Int,
-    isPaused: Boolean,
-    onTogglePause: () -> Unit,
-    onSpeedChange: (Int) -> Unit,
-    onClose: () -> Unit
-) {
-    val totalMins = simSecondsElapsed / 60
-    val hours = 6 + (totalMins / 60)
-    val mins = totalMins % 60
-    val clockStr = "%02d:%02d AM".format(if (hours > 12) hours - 12 else hours, mins)
-
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh
-        ),
-        elevation = CardDefaults.cardElevation(defaultElevation = 6.dp)
-    ) {
-        Column(modifier = Modifier.padding(12.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column {
-                    Text(
-                        text = "🌅 DISPATCH SHIFT CLOCK",
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                    Text(
-                        text = clockStr,
-                        fontSize = 18.sp,
-                        fontWeight = FontWeight.ExtraBold,
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
-                }
-
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = onTogglePause) {
-                        Icon(
-                            imageVector = if (isPaused) Icons.Default.PlayArrow else Icons.Default.Close,
-                            contentDescription = "Pause",
-                            tint = MaterialTheme.colorScheme.primary
-                        )
-                    }
-                    IconButton(onClick = onClose, modifier = Modifier.size(24.dp)) {
-                        Icon(Icons.Default.Close, contentDescription = "Close", tint = MaterialTheme.colorScheme.outline)
-                    }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(6.dp))
-
-            // Speed Multiplier Chips including 1x, 10x, 30x, 60x
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                listOf(1, 10, 30, 60).forEach { speed ->
-                    FilterChip(
-                        selected = speedMultiplier == speed,
-                        onClick = { onSpeedChange(speed) },
-                        label = { Text("${speed}x", fontSize = 11.sp, maxLines = 1, softWrap = false) }
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
 fun ActiveDriverStatusCard(
     shiftState: DriverShiftState,
+    isRushHour: Boolean,
     onClose: () -> Unit
 ) {
     val parcel = shiftState.currentParcel
@@ -641,7 +718,41 @@ fun ActiveDriverStatusCard(
 
             Spacer(modifier = Modifier.height(6.dp))
 
-            if (parcel != null) {
+            if (shiftState.isUnloading && parcel != null) {
+                // 📦 Unloading Delay Banner
+                Surface(
+                    color = MaterialTheme.colorScheme.tertiaryContainer,
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier.padding(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "📦 Unloading & Handover: ${(shiftState.unloadingSecondsRemaining / 60).toInt() + 1} mins remaining at ${parcel.customerName}'s address",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onTertiaryContainer
+                        )
+                    }
+                }
+            } else if (shiftState.isReturningToHub) {
+                // 🏠 Return Trip to Hub Banner
+                Surface(
+                    color = MaterialTheme.colorScheme.secondaryContainer,
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = "🏠 Return Leg: Driving back to YTO Express Nasugbu Hub...",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                        modifier = Modifier.padding(8.dp)
+                    )
+                }
+            } else if (parcel != null) {
                 // Active Leg Tracking Info
                 Text(
                     text = "🚚 Active Leg: Rider Position ➔ Stop #$currentStopNum (${parcel.name})",
@@ -679,93 +790,93 @@ fun ActiveDriverStatusCard(
                         color = MaterialTheme.colorScheme.onPrimaryContainer
                     )
                 }
-
-                Spacer(modifier = Modifier.height(6.dp))
-
-                // Shift Progress Bar
-                val progressRatio = (shiftState.deliveredCount.toFloat() / totalQueueCount.coerceAtLeast(1))
-                LinearProgressIndicator(
-                    progress = { progressRatio },
-                    modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
-                    color = MaterialTheme.colorScheme.primary
-                )
-
-                Spacer(modifier = Modifier.height(6.dp))
-
-                // Toggle Button for Rider's Ordered Parcel Queue
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable { isQueueExpanded = !isQueueExpanded }
-                        .padding(vertical = 2.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "📋 Delivery Queue ($totalQueueCount stops) - Heaviest First",
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                    Text(
-                        text = if (isQueueExpanded) "▲ Hide" else "▼ View Order",
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                }
-
-                if (isQueueExpanded) {
-                    Spacer(modifier = Modifier.height(4.dp))
-                    LazyColumn(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(150.dp)
-                            .background(
-                                MaterialTheme.colorScheme.surface,
-                                shape = RoundedCornerShape(8.dp)
-                            )
-                            .padding(6.dp)
-                    ) {
-                        itemsIndexed(shiftState.parcelQueue) { index, item ->
-                            val stopNum = index + 1
-                            val statusIcon = when (item.status) {
-                                DeliveryStatus.DELIVERED -> "✅"
-                                DeliveryStatus.IN_TRANSIT -> "🚚"
-                                DeliveryStatus.PENDING -> "⏳"
-                            }
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(vertical = 4.dp, horizontal = 6.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = "$statusIcon Stop #$stopNum: ${item.name} (${item.weightKg} kg)",
-                                    fontSize = 11.sp,
-                                    fontWeight = if (index == shiftState.currentParcelIndex) FontWeight.Bold else FontWeight.Normal,
-                                    color = if (index == shiftState.currentParcelIndex) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
-                                    maxLines = 1,
-                                    modifier = Modifier.weight(1f)
-                                )
-                                Text(
-                                    text = if (item.status == DeliveryStatus.DELIVERED) "Delivered" else "%.1f km".format(item.distanceFromHubKm),
-                                    fontSize = 10.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    color = MaterialTheme.colorScheme.outline
-                                )
-                            }
-                        }
-                    }
-                }
             } else {
                 Text(
-                    text = "🎉 SHIFT COMPLETE! All $totalQueueCount assigned parcels delivered.",
+                    text = "🎉 SHIFT COMPLETE! Returned to Nasugbu Hub.",
                     fontSize = 13.sp,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.primary
                 )
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
+
+            // Shift Progress Bar
+            val progressRatio = (shiftState.deliveredCount.toFloat() / totalQueueCount.coerceAtLeast(1))
+            LinearProgressIndicator(
+                progress = { progressRatio },
+                modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
+                color = MaterialTheme.colorScheme.primary
+            )
+
+            Spacer(modifier = Modifier.height(6.dp))
+
+            // Toggle Button for Rider's Ordered Parcel Queue
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { isQueueExpanded = !isQueueExpanded }
+                    .padding(vertical = 2.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "📋 Delivery Queue ($totalQueueCount stops) - Heaviest First",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+                Text(
+                    text = if (isQueueExpanded) "▲ Hide" else "▼ View Order",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
+
+            if (isQueueExpanded) {
+                Spacer(modifier = Modifier.height(4.dp))
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(150.dp)
+                        .background(
+                            MaterialTheme.colorScheme.surface,
+                            shape = RoundedCornerShape(8.dp)
+                        )
+                        .padding(6.dp)
+                ) {
+                    itemsIndexed(shiftState.parcelQueue) { index, item ->
+                        val stopNum = index + 1
+                        val statusIcon = when (item.status) {
+                            DeliveryStatus.DELIVERED -> "✅"
+                            DeliveryStatus.IN_TRANSIT -> "🚚"
+                            DeliveryStatus.PENDING -> "⏳"
+                        }
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp, horizontal = 6.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "$statusIcon Stop #$stopNum: ${item.name} (${item.weightKg} kg)",
+                                fontSize = 11.sp,
+                                fontWeight = if (index == shiftState.currentParcelIndex) FontWeight.Bold else FontWeight.Normal,
+                                color = if (index == shiftState.currentParcelIndex) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                                maxLines = 1,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Text(
+                                text = if (item.status == DeliveryStatus.DELIVERED) "Delivered" else "%.1f km".format(item.distanceFromHubKm),
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.outline
+                            )
+                        }
+                    }
+                }
             }
         }
     }
@@ -787,19 +898,43 @@ fun DriverSelectorBar(
             horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             items(drivers) { driver ->
-                FilterChip(
-                    selected = selectedDriverId == driver.id,
-                    onClick = { onSelectDriver(driver.id) },
-                    label = {
+                val isSelected = selectedDriverId == driver.id
+                Surface(
+                    color = if (isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface,
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier
+                        .clickable { onSelectDriver(driver.id) }
+                        .then(
+                            if (isSelected) Modifier.border(
+                                width = 1.5.dp,
+                                color = MaterialTheme.colorScheme.primary,
+                                shape = RoundedCornerShape(16.dp)
+                            ) else Modifier
+                        )
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
                         Text(
-                            text = "${driver.name} (${driver.vehicleType.name})",
+                            text = when (driver.vehicleType) {
+                                VehicleType.MOTORCYCLE -> "🏍️"
+                                VehicleType.L300 -> "🚐"
+                                VehicleType.TRUCK -> "🚚"
+                            },
+                            fontSize = 12.sp
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = driver.name.split(" ").first(),
                             fontSize = 12.sp,
-                            fontWeight = FontWeight.Bold,
+                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                            color = if (isSelected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface,
                             maxLines = 1,
                             softWrap = false
                         )
                     }
-                )
+                }
             }
         }
     }
@@ -1225,43 +1360,57 @@ fun MapLibreView(
         }
     }
 
-    // Selected Driver's active leg parcel ID
+    // Selected Driver's active leg parcel ID or return leg
     val activeShift = driverShiftStates.firstOrNull { it.driver.id == selectedDriverId }
-    val currentSelectedParcelId = activeShift?.currentParcel?.id ?: ""
+    val currentSelectedParcelId = activeShift?.currentParcel?.id ?: "RETURN_HUB"
 
-    // 1. NON-FLASHING Active Leg Route Line & Target Destination Marker Updates
-    LaunchedEffect(selectedDriverId, currentSelectedParcelId) {
+    // 1. Active Leg Route Line & Target Destination Marker Updates
+    LaunchedEffect(selectedDriverId, currentSelectedParcelId, activeShift?.isReturningToHub) {
         val map = mapInstance ?: return@LaunchedEffect
         val shift = activeShift ?: return@LaunchedEffect
-        val parcel = shift.currentParcel ?: return@LaunchedEffect
 
-        // Remove previous active leg route line & target marker
         routePolyline?.remove()
         targetDestMarker?.remove()
 
-        val targetPoint = LatLng(parcel.destinationLat, parcel.destinationLng)
+        val parcel = shift.currentParcel
+        if (parcel != null) {
+            val targetPoint = LatLng(parcel.destinationLat, parcel.destinationLng)
 
-        // Add Target Customer Destination Pin Marker
-        targetDestMarker = map.addMarker(
-            MarkerOptions()
-                .position(targetPoint)
-                .title("Target Stop #${shift.currentParcelIndex + 1}: ${parcel.customerName}")
-                .snippet("${parcel.name} (${parcel.weightKg} kg)")
-        )
+            // Add Target Customer Destination Pin Marker
+            targetDestMarker = map.addMarker(
+                MarkerOptions()
+                    .position(targetPoint)
+                    .title("Target Stop #${shift.currentParcelIndex + 1}: ${parcel.customerName}")
+                    .snippet("${parcel.name} (${parcel.weightKg} kg)")
+            )
 
-        // Draw active leg road line from legStart -> target destination
-        val waypoints = parcel.getRoadWaypoints(
-            startLat = shift.legStartLat,
-            startLng = shift.legStartLng
-        ).map { LatLng(it.first, it.second) }
+            val waypoints = parcel.getRoadWaypoints(
+                startLat = shift.legStartLat,
+                startLng = shift.legStartLng
+            ).map { LatLng(it.first, it.second) }
 
-        val routeOptions = PolylineOptions()
-            .addAll(waypoints)
-            .color(Color.parseColor("#1976D2")) // Solid Vibrant Blue Road Line
-            .width(3.0f) // Thin line width
-        routePolyline = map.addPolyline(routeOptions)
+            val routeOptions = PolylineOptions()
+                .addAll(waypoints)
+                .color(Color.parseColor("#1976D2")) // Solid Vibrant Blue Road Line
+                .width(3.0f)
+            routePolyline = map.addPolyline(routeOptions)
+        } else if (shift.isReturningToHub) {
+            // Return leg to Nasugbu Hub
+            val waypoints = generateRoadRoutePoints(
+                startLat = shift.legStartLat,
+                startLng = shift.legStartLng,
+                destLat = 14.0657415,
+                destLng = 120.6334763
+            ).map { LatLng(it.first, it.second) }
 
-        // Smooth camera focus for active driver when selected
+            val routeOptions = PolylineOptions()
+                .addAll(waypoints)
+                .color(Color.parseColor("#1976D2"))
+                .width(3.0f)
+            routePolyline = map.addPolyline(routeOptions)
+        }
+
+        // Camera focus for active driver
         if (shift.currentLat != 14.0657415 || shift.currentLng != 120.6334763) {
             map.animateCamera(
                 CameraUpdateFactory.newLatLngZoom(LatLng(shift.currentLat, shift.currentLng), 11.2),
@@ -1270,26 +1419,49 @@ fun MapLibreView(
         }
     }
 
-    // 2. Live Marker Position Updates (Updates vehicle positions on every tick without re-creating route polyline!)
+    // 2. Live Marker Position & Dynamic Callout Updates (Updates vehicle positions + moving callouts)
     LaunchedEffect(simSecondsElapsed) {
         val map = mapInstance ?: return@LaunchedEffect
 
         driverShiftStates.forEach { shiftState ->
             val driverId = shiftState.driver.id
             val currPoint = LatLng(shiftState.currentLat, shiftState.currentLng)
+            val parcel = shiftState.currentParcel
+
+            val calloutTitle = when {
+                shiftState.isUnloading && parcel != null -> "Unloading at ${parcel.customerName}"
+                shiftState.isReturningToHub -> "Returning to Nasugbu Hub"
+                shiftState.isShiftFullyCompleted -> "Shift Completed"
+                parcel != null -> parcel.name
+                else -> "Idle"
+            }
+            val calloutSubtitle = when {
+                shiftState.isUnloading && parcel != null -> "Handover in progress"
+                shiftState.isReturningToHub -> "Hub Base"
+                shiftState.isShiftFullyCompleted -> "Nasugbu Hub"
+                parcel != null -> parcel.destinationAddress
+                else -> "YTO Express"
+            }
+
+            val vehicleBitmap = createVehicleCalloutMarkerBitmap(
+                vehicleType = shiftState.driver.vehicleType,
+                driverName = shiftState.driver.name,
+                parcelName = calloutTitle,
+                destAddress = calloutSubtitle
+            )
+            val vehicleIcon = IconFactory.getInstance(context).fromBitmap(vehicleBitmap)
 
             val existingMarker = vehicleMarkers[driverId]
             if (existingMarker != null) {
                 existingMarker.position = currPoint
+                existingMarker.setIcon(vehicleIcon)
             } else {
-                val vehicleBitmap = createVehicleMarkerBitmap(shiftState.driver.vehicleType)
-                val vehicleIcon = IconFactory.getInstance(context).fromBitmap(vehicleBitmap)
                 val newMarker = map.addMarker(
                     MarkerOptions()
                         .position(currPoint)
                         .icon(vehicleIcon)
                         .title("Driver: ${shiftState.driver.name}")
-                        .snippet("${shiftState.driver.vehicleName} (${shiftState.driver.licensePlate})")
+                        .snippet("$calloutTitle -> $calloutSubtitle")
                 )
                 if (newMarker != null) {
                     vehicleMarkers[driverId] = newMarker
@@ -1420,44 +1592,68 @@ private fun createCustomMarkerBitmap(): Bitmap {
 }
 
 /**
- * Creates custom vehicle marker bitmaps based on vehicle type (Motorcycle, L300, Truck).
+ * Creates dynamic vehicle marker bitmaps with callout text box (Item & Destination) attached to the moving rider.
  */
-private fun createVehicleMarkerBitmap(vehicleType: VehicleType): Bitmap {
-    val width = 84
-    val height = 84
+private fun createVehicleCalloutMarkerBitmap(
+    vehicleType: VehicleType,
+    driverName: String,
+    parcelName: String,
+    destAddress: String
+): Bitmap {
+    val width = 260
+    val height = 130
     val bitmap = createBitmap(width, height)
     val canvas = Canvas(bitmap)
 
+    val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+    // Draw callout box background (Dark navy card)
+    paint.color = Color.parseColor("#1E293B")
+    paint.style = Paint.Style.FILL
+    val rectF = RectF(4f, 4f, width - 4f, 82f)
+    canvas.drawRoundRect(rectF, 14f, 14f, paint)
+
+    // Draw callout border
+    paint.color = Color.parseColor("#3B82F6")
+    paint.style = Paint.Style.STROKE
+    paint.strokeWidth = 3f
+    canvas.drawRoundRect(rectF, 14f, 14f, paint)
+
+    // Draw Text Line 1: Item Name
+    paint.style = Paint.Style.FILL
+    paint.color = Color.WHITE
+    paint.textSize = 18f
+    paint.typeface = Typeface.DEFAULT_BOLD
+    paint.textAlign = Paint.Align.LEFT
+    val itemText = "Item: $parcelName".take(24)
+    canvas.drawText(itemText, 16f, 32f, paint)
+
+    // Draw Text Line 2: Destination Address
+    paint.color = Color.parseColor("#94A3B8")
+    paint.textSize = 15f
+    paint.typeface = Typeface.DEFAULT
+    val destText = "Dest: $destAddress".take(26)
+    canvas.drawText(destText, 16f, 60f, paint)
+
+    // Draw Vehicle Circle Icon below callout
     val colorHex = when (vehicleType) {
-        VehicleType.MOTORCYCLE -> "#FF6D00" // Vibrant Orange for Motorcycle 🏍️
-        VehicleType.L300 -> "#2979FF"       // Vibrant Blue for L300 🚐
-        VehicleType.TRUCK -> "#9C27B0"      // Vibrant Purple for Heavy Truck 🚚
+        VehicleType.MOTORCYCLE -> "#FF6D00"
+        VehicleType.L300 -> "#2979FF"
+        VehicleType.TRUCK -> "#9C27B0"
     }
-
-    val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor(colorHex)
-        style = Paint.Style.FILL
-    }
-
-    // Outer Circle Shadow/Border
+    paint.color = Color.parseColor(colorHex)
+    paint.style = Paint.Style.FILL
     val centerX = width / 2f
-    val centerY = height / 2f
-    canvas.drawCircle(centerX, centerY, 38f, paint)
+    val centerY = 106f
+    canvas.drawCircle(centerX, centerY, 20f, paint)
 
-    // Inner White Ring
     paint.color = Color.WHITE
     paint.style = Paint.Style.STROKE
-    paint.strokeWidth = 5f
-    canvas.drawCircle(centerX, centerY, 35f, paint)
+    paint.strokeWidth = 3f
+    canvas.drawCircle(centerX, centerY, 18f, paint)
 
-    // Inner Solid Circle
     paint.style = Paint.Style.FILL
-    paint.color = Color.parseColor(colorHex)
-    canvas.drawCircle(centerX, centerY, 28f, paint)
-
-    // Center Vehicle Symbol Text
-    paint.color = Color.WHITE
-    paint.textSize = 22f
+    paint.textSize = 13f
     paint.textAlign = Paint.Align.CENTER
     paint.typeface = Typeface.DEFAULT_BOLD
     val symbolStr = when (vehicleType) {
