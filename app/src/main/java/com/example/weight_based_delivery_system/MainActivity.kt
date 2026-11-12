@@ -104,6 +104,7 @@ import com.example.weight_based_delivery_system.data.RouteFetchStatus
 import com.example.weight_based_delivery_system.data.VehicleType
 import com.example.weight_based_delivery_system.data.calculateDistanceKm
 import com.example.weight_based_delivery_system.data.interpolateAlongRoute
+import com.example.weight_based_delivery_system.data.osrmProfile
 import com.example.weight_based_delivery_system.ui.theme.Weight_based_delivery_systemTheme
 import kotlinx.coroutines.delay
 import org.maplibre.android.MapLibre
@@ -202,7 +203,7 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
     var isBottomSheetOpen by remember { mutableStateOf(false) }
     var detailParcelItem by remember { mutableStateOf<ParcelItem?>(null) }
 
-    // Asynchronously fetch OSRM turn-by-turn road routes for each rider's active leg
+    // Asynchronously fetch OSRM turn-by-turn road routes for each rider's active leg with retry & backoff
     driverShiftStates.forEach { shiftState ->
         val parcel = shiftState.currentParcel
         val destLat = parcel?.destinationLat ?: hubLat
@@ -211,22 +212,49 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
 
         LaunchedEffect(shiftState.driver.id, shiftState.currentParcelIndex, shiftState.riderState) {
             if (shiftState.riderState == RiderState.EN_ROUTE || shiftState.riderState == RiderState.RETURNING) {
-                shiftState.routeStatus = RouteFetchStatus.LOADING
-                val result = OsrmRoutingService.fetchRoute(
-                    driverName = shiftState.driver.name,
-                    legName = legName,
-                    startLat = shiftState.legStartLat,
-                    startLng = shiftState.legStartLng,
-                    destLat = destLat,
-                    destLng = destLng,
-                    vehicleType = shiftState.driver.vehicleType
-                )
+                var backoffMs = 1000L
+                var attempt = 0
+                var success = false
 
-                if (result.isSuccess) {
-                    shiftState.currentRoute = result.getOrNull()
-                    shiftState.routeStatus = RouteFetchStatus.READY
-                } else {
-                    shiftState.routeStatus = RouteFetchStatus.UNAVAILABLE
+                while (!success && (shiftState.riderState == RiderState.EN_ROUTE || shiftState.riderState == RiderState.RETURNING)) {
+                    attempt++
+                    shiftState.retryCount = attempt
+                    shiftState.routeStatus = RouteFetchStatus.LOADING
+                    shiftState.routeSource = "Fetching (Attempt #$attempt)"
+
+                    val result = OsrmRoutingService.fetchRoute(
+                        driverName = shiftState.driver.name,
+                        legName = legName,
+                        startLat = shiftState.legStartLat,
+                        startLng = shiftState.legStartLng,
+                        destLat = destLat,
+                        destLng = destLng,
+                        vehicleType = shiftState.driver.vehicleType
+                    )
+
+                    if (result.isSuccess) {
+                        val route = result.getOrNull()
+                        if (route != null) {
+                            shiftState.currentRoute = route
+                            shiftState.routeStatus = RouteFetchStatus.READY
+                            val isCache = RouteCacheManager.get(
+                                com.example.weight_based_delivery_system.data.buildRouteCacheKey(
+                                    shiftState.legStartLat, shiftState.legStartLng,
+                                    destLat, destLng,
+                                    shiftState.driver.vehicleType.osrmProfile
+                                )
+                            ) != null
+                            shiftState.routeSource = if (isCache) "Cache (${route.points.size} pts)" else "OSRM (${route.points.size} pts)"
+                            success = true
+                        }
+                    }
+
+                    if (!success) {
+                        shiftState.routeStatus = RouteFetchStatus.UNAVAILABLE
+                        shiftState.routeSource = "Unavailable (Retry #$attempt in ${backoffMs / 1000}s)"
+                        delay(backoffMs)
+                        backoffMs = (backoffMs * 2).coerceAtMost(16000L) // Capped backoff at 16s
+                    }
                 }
             }
         }
@@ -905,6 +933,21 @@ fun ActiveDriverStatusCard(
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.onPrimaryContainer
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(4.dp))
+
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    shape = RoundedCornerShape(6.dp)
+                ) {
+                    Text(
+                        text = "🌐 Route Source: ${shiftState.routeSource}",
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                     )
                 }
             } else {
@@ -1721,8 +1764,8 @@ private fun createVehicleCalloutMarkerBitmap(
     parcelName: String,
     destAddress: String
 ): Bitmap {
-    val width = 260
-    val height = 130
+    val width = 280
+    val height = 155
     val bitmap = createBitmap(width, height)
     val canvas = Canvas(bitmap)
 
@@ -1731,7 +1774,7 @@ private fun createVehicleCalloutMarkerBitmap(
     // Draw callout box background (Dark navy card)
     paint.color = Color.parseColor("#1E293B")
     paint.style = Paint.Style.FILL
-    val rectF = RectF(4f, 4f, width - 4f, 82f)
+    val rectF = RectF(4f, 4f, width - 4f, 106f)
     canvas.drawRoundRect(rectF, 14f, 14f, paint)
 
     // Draw callout border
@@ -1740,21 +1783,28 @@ private fun createVehicleCalloutMarkerBitmap(
     paint.strokeWidth = 3f
     canvas.drawRoundRect(rectF, 14f, 14f, paint)
 
-    // Draw Text Line 1: Item Name
+    // Draw Text Line 1: Rider Name
     paint.style = Paint.Style.FILL
-    paint.color = Color.WHITE
-    paint.textSize = 18f
+    paint.color = Color.parseColor("#F59E0B") // Amber gold accent
+    paint.textSize = 17f
     paint.typeface = Typeface.DEFAULT_BOLD
     paint.textAlign = Paint.Align.LEFT
-    val itemText = "Item: $parcelName".take(24)
-    canvas.drawText(itemText, 16f, 32f, paint)
+    val riderText = "Rider: $driverName".take(26)
+    canvas.drawText(riderText, 14f, 28f, paint)
 
-    // Draw Text Line 2: Destination Address
+    // Draw Text Line 2: Item Name
+    paint.color = Color.WHITE
+    paint.textSize = 16f
+    paint.typeface = Typeface.DEFAULT_BOLD
+    val itemText = "Item: $parcelName".take(26)
+    canvas.drawText(itemText, 14f, 58f, paint)
+
+    // Draw Text Line 3: Destination Address
     paint.color = Color.parseColor("#94A3B8")
-    paint.textSize = 15f
+    paint.textSize = 14f
     paint.typeface = Typeface.DEFAULT
-    val destText = "Dest: $destAddress".take(26)
-    canvas.drawText(destText, 16f, 60f, paint)
+    val destText = "Dest: $destAddress".take(28)
+    canvas.drawText(destText, 14f, 88f, paint)
 
     // Draw Vehicle Circle Icon below callout
     val colorHex = when (vehicleType) {
@@ -1765,7 +1815,7 @@ private fun createVehicleCalloutMarkerBitmap(
     paint.color = Color.parseColor(colorHex)
     paint.style = Paint.Style.FILL
     val centerX = width / 2f
-    val centerY = 106f
+    val centerY = 130f
     canvas.drawCircle(centerX, centerY, 20f, paint)
 
     paint.color = Color.WHITE
