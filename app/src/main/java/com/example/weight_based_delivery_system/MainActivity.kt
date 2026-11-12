@@ -31,6 +31,7 @@ import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -55,6 +56,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
@@ -87,8 +89,12 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import com.example.weight_based_delivery_system.data.DeliveryDriver
 import com.example.weight_based_delivery_system.data.DeliveryRepository
+import com.example.weight_based_delivery_system.data.DeliveryStatus
+import com.example.weight_based_delivery_system.data.DriverShiftState
 import com.example.weight_based_delivery_system.data.ParcelItem
 import com.example.weight_based_delivery_system.data.VehicleType
+import com.example.weight_based_delivery_system.data.calculateDistanceKm
+import com.example.weight_based_delivery_system.data.generateRoadRoutePoints
 import com.example.weight_based_delivery_system.ui.theme.Weight_based_delivery_systemTheme
 import kotlinx.coroutines.delay
 import org.maplibre.android.MapLibre
@@ -123,9 +129,6 @@ class MainActivity : ComponentActivity() {
 fun DeliveryDashboard(modifier: Modifier = Modifier) {
     val context = LocalContext.current
 
-    // Load Drivers
-    val drivers = remember { DeliveryRepository.getDrivers() }
-
     // State for Daily Dispatch Parcels (Random 350 to 500 items, sorted Heaviest & Farthest First)
     val dailyDispatchParcels = remember { mutableStateListOf<ParcelItem>() }
 
@@ -140,20 +143,28 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
         }
     }
 
-    // Pick 1 active parcel per driver for simultaneous dispatch at 6:00 AM
-    val activeParcels = remember(dailyDispatchParcels.size) {
-        mutableStateListOf<ParcelItem>().apply {
+    // Load Drivers AFTER repository master pool is populated
+    val drivers = remember(dailyDispatchParcels.size) { DeliveryRepository.getDrivers(context) }
+
+    // Multi-Parcel Sequential Driver Shift States
+    val driverShiftStates = remember(dailyDispatchParcels.size, drivers.size) {
+        mutableStateListOf<DriverShiftState>().apply {
             drivers.forEach { driver ->
-                val assigned = dailyDispatchParcels.firstOrNull { it.assignedDriver.id == driver.id }
-                if (assigned != null) add(assigned)
+                val queue = dailyDispatchParcels.filter { it.assignedDriver.id == driver.id }
+                add(
+                    DriverShiftState(
+                        driver = driver,
+                        parcelQueue = queue
+                    )
+                )
             }
         }
     }
 
     // Selected Driver Focus State (Default to Driver 1 - Mark Santos)
     var selectedDriverId by remember { mutableStateOf(drivers.firstOrNull()?.id ?: "") }
-    val activeSelectedParcel = remember(selectedDriverId, activeParcels) {
-        activeParcels.firstOrNull { it.assignedDriver.id == selectedDriverId }
+    val activeSelectedShift = remember(selectedDriverId, driverShiftStates.size) {
+        driverShiftStates.firstOrNull { it.driver.id == selectedDriverId }
     }
 
     // Central 6:00 AM Dispatch Simulation Clock & Multiplier
@@ -169,35 +180,62 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
     var isBottomSheetOpen by remember { mutableStateOf(false) }
     var detailParcelItem by remember { mutableStateOf<ParcelItem?>(null) }
 
-    // Central 6:00 AM Simultaneous Dispatch Engine
+    // Central 6:00 AM Multi-Parcel Sequential Dispatch Simulation Engine
     LaunchedEffect(isPaused, simSpeedMultiplier, dailyDispatchParcels.size) {
         while (!isPaused) {
             delay(100)
-            simSecondsElapsed += (1 * (simSpeedMultiplier / 10).coerceAtLeast(1))
+            val stepSeconds = (1 * (simSpeedMultiplier / 10).coerceAtLeast(1))
+            simSecondsElapsed += stepSeconds
 
-            // Update live progress and coordinates for ALL 5 vehicles along road paths
-            activeParcels.forEach { parcel ->
-                val waypoints = parcel.getRoadWaypoints()
-                val totalDistanceKm = parcel.distanceFromHubKm
-                val speedKmH = parcel.assignedDriver.vehicleType.avgSpeedKmH
-                val totalTravelSeconds = ((totalDistanceKm / speedKmH) * 3600).coerceAtLeast(60.0)
+            // Update movement across full parcel queues for ALL 5 drivers concurrently
+            driverShiftStates.forEach { shiftState ->
+                val parcel = shiftState.currentParcel
+                if (parcel != null) {
+                    parcel.status = DeliveryStatus.IN_TRANSIT
 
-                val progress = (simSecondsElapsed / totalTravelSeconds).coerceIn(0.0, 1.0).toFloat()
-                parcel.animationProgress = progress
+                    val waypoints = generateRoadRoutePoints(
+                        startLat = shiftState.legStartLat,
+                        startLng = shiftState.legStartLng,
+                        destLat = parcel.destinationLat,
+                        destLng = parcel.destinationLng
+                    )
 
-                // Interpolate vehicle position along road waypoints
-                val currPos = interpolatePath(waypoints, progress.toDouble())
-                parcel.currentLat = currPos.first
-                parcel.currentLng = currPos.second
+                    val legDistanceKm = calculateDistanceKm(
+                        shiftState.legStartLat, shiftState.legStartLng,
+                        parcel.destinationLat, parcel.destinationLng
+                    )
+                    val speedKmH = shiftState.driver.vehicleType.avgSpeedKmH
+                    val totalLegSeconds = ((legDistanceKm / speedKmH) * 3600).coerceAtLeast(30.0)
+
+                    shiftState.legSecondsElapsed += stepSeconds
+                    val progress = (shiftState.legSecondsElapsed / totalLegSeconds).coerceIn(0.0, 1.0)
+                    parcel.animationProgress = progress.toFloat()
+
+                    // Interpolate current vehicle coordinates along road path
+                    val currPos = interpolatePath(waypoints, progress)
+                    shiftState.currentLat = currPos.first
+                    shiftState.currentLng = currPos.second
+                    parcel.currentLat = currPos.first
+                    parcel.currentLng = currPos.second
+
+                    // When arrived at stop, mark DELIVERED and advance automatically to next parcel in queue!
+                    if (progress >= 1.0) {
+                        parcel.status = DeliveryStatus.DELIVERED
+                        shiftState.legStartLat = parcel.destinationLat
+                        shiftState.legStartLng = parcel.destinationLng
+                        shiftState.legSecondsElapsed = 0.0
+                        shiftState.currentParcelIndex += 1
+                    }
+                }
             }
         }
     }
 
     Box(modifier = modifier.fillMaxSize()) {
-        // Lightweight Map View displaying 5 moving vehicles + ONLY selected driver's road route line (NO FLASHING)
+        // Lightweight Map View displaying 5 moving vehicles + ONLY selected driver's active leg road route line
         MapLibreView(
             modifier = Modifier.fillMaxSize(),
-            activeParcels = activeParcels,
+            driverShiftStates = driverShiftStates,
             selectedDriverId = selectedDriverId,
             simSecondsElapsed = simSecondsElapsed
         )
@@ -207,7 +245,7 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
             modifier = Modifier
                 .align(Alignment.TopStart)
                 .padding(16.dp)
-                .fillMaxWidth(0.8f)
+                .fillMaxWidth(0.85f)
         ) {
             AnimatedVisibility(visible = showClockPanel, enter = fadeIn(), exit = fadeOut()) {
                 SimulationClockCard(
@@ -223,9 +261,9 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
             if (showClockPanel && showDriverInfoPanel) Spacer(modifier = Modifier.height(8.dp))
 
             AnimatedVisibility(visible = showDriverInfoPanel, enter = fadeIn(), exit = fadeOut()) {
-                activeSelectedParcel?.let { parcel ->
+                activeSelectedShift?.let { shift ->
                     ActiveDriverStatusCard(
-                        parcel = parcel,
+                        shiftState = shift,
                         onClose = { showDriverInfoPanel = false }
                     )
                 }
@@ -514,14 +552,14 @@ fun SimulationClockCard(
 
             Spacer(modifier = Modifier.height(6.dp))
 
-            // Speed Multiplier Chips in a horizontal scrollable row
+            // Speed Multiplier Chips including 1x, 10x, 30x, 60x
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(4.dp)
             ) {
-                listOf(10, 30, 60).forEach { speed ->
+                listOf(1, 10, 30, 60).forEach { speed ->
                     FilterChip(
                         selected = speedMultiplier == speed,
                         onClick = { onSpeedChange(speed) },
@@ -535,12 +573,13 @@ fun SimulationClockCard(
 
 @Composable
 fun ActiveDriverStatusCard(
-    parcel: ParcelItem,
+    shiftState: DriverShiftState,
     onClose: () -> Unit
 ) {
-    val remainingKm = parcel.remainingDistanceKm
-    val speed = parcel.assignedDriver.vehicleType.avgSpeedKmH
-    val remainingEtaMins = kotlin.math.max(0, ((remainingKm / speed) * 60).toInt())
+    val parcel = shiftState.currentParcel
+    val totalQueueCount = shiftState.parcelQueue.size
+    val currentStopNum = shiftState.currentParcelIndex + 1
+    var isQueueExpanded by remember { mutableStateOf(false) }
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -551,6 +590,7 @@ fun ActiveDriverStatusCard(
         elevation = CardDefaults.cardElevation(defaultElevation = 6.dp)
     ) {
         Column(modifier = Modifier.padding(12.dp)) {
+            // Header Row: Driver Name, Vehicle, License Plate
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -567,7 +607,7 @@ fun ActiveDriverStatusCard(
                     )
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = "${parcel.assignedDriver.name} (${parcel.assignedDriver.vehicleName})",
+                        text = "${shiftState.driver.name} (${shiftState.driver.vehicleName})",
                         fontWeight = FontWeight.Bold,
                         fontSize = 13.sp,
                         color = MaterialTheme.colorScheme.onPrimaryContainer,
@@ -582,7 +622,7 @@ fun ActiveDriverStatusCard(
                     modifier = Modifier.wrapContentWidth()
                 ) {
                     Text(
-                        text = parcel.assignedDriver.vehicleType.name,
+                        text = shiftState.driver.vehicleType.name,
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.onPrimary,
@@ -599,57 +639,132 @@ fun ActiveDriverStatusCard(
                 }
             }
 
-            Spacer(modifier = Modifier.height(4.dp))
-
-            Text(
-                text = "📦 Parcel: ${parcel.name} (${parcel.weightKg} kg)",
-                fontSize = 12.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = MaterialTheme.colorScheme.onPrimaryContainer,
-                maxLines = 1,
-                softWrap = false
-            )
-
-            Text(
-                text = "📍 Dest: ${parcel.destinationAddress}",
-                fontSize = 11.sp,
-                color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f),
-                maxLines = 1,
-                softWrap = false
-            )
-
-            Spacer(modifier = Modifier.height(4.dp))
-
-            Surface(
-                color = MaterialTheme.colorScheme.secondaryContainer,
-                shape = RoundedCornerShape(4.dp)
-            ) {
-                Text(
-                    text = "⚖️ Priority Order: Heaviest & Farthest First",
-                    fontSize = 10.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onSecondaryContainer,
-                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                )
-            }
-
             Spacer(modifier = Modifier.height(6.dp))
 
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
+            if (parcel != null) {
+                // Active Leg Tracking Info
                 Text(
-                    text = "Distance: %.2f km".format(remainingKm),
-                    fontSize = 11.sp,
+                    text = "🚚 Active Leg: Rider Position ➔ Stop #$currentStopNum (${parcel.name})",
+                    fontSize = 12.sp,
                     fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onPrimaryContainer
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                    maxLines = 1,
+                    softWrap = false
                 )
+
                 Text(
-                    text = if (parcel.animationProgress >= 1.0f) "✅ DELIVERED!" else "⏱️ ETA: $remainingEtaMins mins",
+                    text = "📍 Target Destination: ${parcel.destinationAddress} (${parcel.customerName})",
                     fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.85f),
+                    maxLines = 1,
+                    softWrap = false
+                )
+
+                Spacer(modifier = Modifier.height(6.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = "Remaining Payload: %.1f kg".format(shiftState.currentPayloadWeightKg),
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer
+                    )
+                    Text(
+                        text = "⏱️ Leg ETA: ${parcel.estimatedTimeMinutes} mins",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(6.dp))
+
+                // Shift Progress Bar
+                val progressRatio = (shiftState.deliveredCount.toFloat() / totalQueueCount.coerceAtLeast(1))
+                LinearProgressIndicator(
+                    progress = { progressRatio },
+                    modifier = Modifier.fillMaxWidth().height(6.dp).clip(RoundedCornerShape(3.dp)),
+                    color = MaterialTheme.colorScheme.primary
+                )
+
+                Spacer(modifier = Modifier.height(6.dp))
+
+                // Toggle Button for Rider's Ordered Parcel Queue
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { isQueueExpanded = !isQueueExpanded }
+                        .padding(vertical = 2.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "📋 Delivery Queue ($totalQueueCount stops) - Heaviest First",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Text(
+                        text = if (isQueueExpanded) "▲ Hide" else "▼ View Order",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+
+                if (isQueueExpanded) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(150.dp)
+                            .background(
+                                MaterialTheme.colorScheme.surface,
+                                shape = RoundedCornerShape(8.dp)
+                            )
+                            .padding(6.dp)
+                    ) {
+                        itemsIndexed(shiftState.parcelQueue) { index, item ->
+                            val stopNum = index + 1
+                            val statusIcon = when (item.status) {
+                                DeliveryStatus.DELIVERED -> "✅"
+                                DeliveryStatus.IN_TRANSIT -> "🚚"
+                                DeliveryStatus.PENDING -> "⏳"
+                            }
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 4.dp, horizontal = 6.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "$statusIcon Stop #$stopNum: ${item.name} (${item.weightKg} kg)",
+                                    fontSize = 11.sp,
+                                    fontWeight = if (index == shiftState.currentParcelIndex) FontWeight.Bold else FontWeight.Normal,
+                                    color = if (index == shiftState.currentParcelIndex) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                                    maxLines = 1,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                Text(
+                                    text = if (item.status == DeliveryStatus.DELIVERED) "Delivered" else "%.1f km".format(item.distanceFromHubKm),
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.outline
+                                )
+                            }
+                        }
+                    }
+                }
+            } else {
+                Text(
+                    text = "🎉 SHIFT COMPLETE! All $totalQueueCount assigned parcels delivered.",
+                    fontSize = 13.sp,
                     fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onPrimaryContainer
+                    color = MaterialTheme.colorScheme.primary
                 )
             }
         }
@@ -1062,7 +1177,7 @@ fun ParcelDetailView(
 @Composable
 fun MapLibreView(
     modifier: Modifier = Modifier,
-    activeParcels: List<ParcelItem>,
+    driverShiftStates: List<DriverShiftState>,
     selectedDriverId: String,
     simSecondsElapsed: Int
 ) {
@@ -1074,6 +1189,7 @@ fun MapLibreView(
 
     var mapInstance by remember { mutableStateOf<MapLibreMap?>(null) }
     var routePolyline by remember { mutableStateOf<Polyline?>(null) }
+    var targetDestMarker by remember { mutableStateOf<Marker?>(null) }
     val vehicleMarkers = remember { mutableStateMapOf<String, Marker>() }
 
     val mapView = remember {
@@ -1109,53 +1225,75 @@ fun MapLibreView(
         }
     }
 
-    // 1. NON-FLASHING Route Polyline update (ONLY re-runs when selectedDriverId changes)
-    LaunchedEffect(selectedDriverId, activeParcels.size) {
-        val map = mapInstance ?: return@LaunchedEffect
-        val selectedParcel = activeParcels.firstOrNull { it.assignedDriver.id == selectedDriverId } ?: return@LaunchedEffect
+    // Selected Driver's active leg parcel ID
+    val activeShift = driverShiftStates.firstOrNull { it.driver.id == selectedDriverId }
+    val currentSelectedParcelId = activeShift?.currentParcel?.id ?: ""
 
-        // Remove previous route line and add thin, solid blue road line
+    // 1. NON-FLASHING Active Leg Route Line & Target Destination Marker Updates
+    LaunchedEffect(selectedDriverId, currentSelectedParcelId) {
+        val map = mapInstance ?: return@LaunchedEffect
+        val shift = activeShift ?: return@LaunchedEffect
+        val parcel = shift.currentParcel ?: return@LaunchedEffect
+
+        // Remove previous active leg route line & target marker
         routePolyline?.remove()
-        val waypoints = selectedParcel.getRoadWaypoints().map { LatLng(it.first, it.second) }
+        targetDestMarker?.remove()
+
+        val targetPoint = LatLng(parcel.destinationLat, parcel.destinationLng)
+
+        // Add Target Customer Destination Pin Marker
+        targetDestMarker = map.addMarker(
+            MarkerOptions()
+                .position(targetPoint)
+                .title("Target Stop #${shift.currentParcelIndex + 1}: ${parcel.customerName}")
+                .snippet("${parcel.name} (${parcel.weightKg} kg)")
+        )
+
+        // Draw active leg road line from legStart -> target destination
+        val waypoints = parcel.getRoadWaypoints(
+            startLat = shift.legStartLat,
+            startLng = shift.legStartLng
+        ).map { LatLng(it.first, it.second) }
+
         val routeOptions = PolylineOptions()
             .addAll(waypoints)
             .color(Color.parseColor("#1976D2")) // Solid Vibrant Blue Road Line
             .width(3.0f) // Thin line width
         routePolyline = map.addPolyline(routeOptions)
+
+        // Smooth camera focus for active driver when selected
+        if (shift.currentLat != 14.0657415 || shift.currentLng != 120.6334763) {
+            map.animateCamera(
+                CameraUpdateFactory.newLatLngZoom(LatLng(shift.currentLat, shift.currentLng), 11.2),
+                600
+            )
+        }
     }
 
     // 2. Live Marker Position Updates (Updates vehicle positions on every tick without re-creating route polyline!)
     LaunchedEffect(simSecondsElapsed) {
         val map = mapInstance ?: return@LaunchedEffect
 
-        activeParcels.forEach { parcel ->
-            val driverId = parcel.assignedDriver.id
-            val currPoint = LatLng(parcel.currentLat, parcel.currentLng)
+        driverShiftStates.forEach { shiftState ->
+            val driverId = shiftState.driver.id
+            val currPoint = LatLng(shiftState.currentLat, shiftState.currentLng)
 
             val existingMarker = vehicleMarkers[driverId]
             if (existingMarker != null) {
                 existingMarker.position = currPoint
             } else {
-                val vehicleBitmap = createVehicleMarkerBitmap(parcel.assignedDriver.vehicleType)
+                val vehicleBitmap = createVehicleMarkerBitmap(shiftState.driver.vehicleType)
                 val vehicleIcon = IconFactory.getInstance(context).fromBitmap(vehicleBitmap)
                 val newMarker = map.addMarker(
                     MarkerOptions()
                         .position(currPoint)
                         .icon(vehicleIcon)
-                        .title("Driver: ${parcel.assignedDriver.name}")
-                        .snippet("${parcel.assignedDriver.vehicleName} (${parcel.assignedDriver.licensePlate})")
+                        .title("Driver: ${shiftState.driver.name}")
+                        .snippet("${shiftState.driver.vehicleName} (${shiftState.driver.licensePlate})")
                 )
                 if (newMarker != null) {
                     vehicleMarkers[driverId] = newMarker
                 }
-            }
-
-            // Smooth camera follow for active driver
-            if (driverId == selectedDriverId) {
-                map.animateCamera(
-                    CameraUpdateFactory.newLatLngZoom(currPoint, 11.2),
-                    300
-                )
             }
         }
     }
