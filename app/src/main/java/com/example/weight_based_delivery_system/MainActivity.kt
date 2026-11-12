@@ -1764,8 +1764,8 @@ private fun createVehicleCalloutMarkerBitmap(
     parcelName: String,
     destAddress: String
 ): Bitmap {
-    val width = 280
-    val height = 155
+    val width = 260
+    val height = 130
     val bitmap = createBitmap(width, height)
     val canvas = Canvas(bitmap)
 
@@ -1774,7 +1774,7 @@ private fun createVehicleCalloutMarkerBitmap(
     // Draw callout box background (Dark navy card)
     paint.color = Color.parseColor("#1E293B")
     paint.style = Paint.Style.FILL
-    val rectF = RectF(4f, 4f, width - 4f, 106f)
+    val rectF = RectF(4f, 4f, width - 4f, 82f)
     canvas.drawRoundRect(rectF, 14f, 14f, paint)
 
     // Draw callout border
@@ -1783,28 +1783,21 @@ private fun createVehicleCalloutMarkerBitmap(
     paint.strokeWidth = 3f
     canvas.drawRoundRect(rectF, 14f, 14f, paint)
 
-    // Draw Text Line 1: Rider Name
+    // Draw Text Line 1: Item Name
     paint.style = Paint.Style.FILL
-    paint.color = Color.parseColor("#F59E0B") // Amber gold accent
-    paint.textSize = 17f
+    paint.color = Color.WHITE
+    paint.textSize = 18f
     paint.typeface = Typeface.DEFAULT_BOLD
     paint.textAlign = Paint.Align.LEFT
-    val riderText = "Rider: $driverName".take(26)
-    canvas.drawText(riderText, 14f, 28f, paint)
+    val itemText = "Item: $parcelName".take(24)
+    canvas.drawText(itemText, 16f, 32f, paint)
 
-    // Draw Text Line 2: Item Name
-    paint.color = Color.WHITE
-    paint.textSize = 16f
-    paint.typeface = Typeface.DEFAULT_BOLD
-    val itemText = "Item: $parcelName".take(26)
-    canvas.drawText(itemText, 14f, 58f, paint)
-
-    // Draw Text Line 3: Destination Address
+    // Draw Text Line 2: Destination Address
     paint.color = Color.parseColor("#94A3B8")
-    paint.textSize = 14f
+    paint.textSize = 15f
     paint.typeface = Typeface.DEFAULT
-    val destText = "Dest: $destAddress".take(28)
-    canvas.drawText(destText, 14f, 88f, paint)
+    val destText = "Dest: $destAddress".take(26)
+    canvas.drawText(destText, 16f, 60f, paint)
 
     // Draw Vehicle Circle Icon below callout
     val colorHex = when (vehicleType) {
@@ -1815,7 +1808,7 @@ private fun createVehicleCalloutMarkerBitmap(
     paint.color = Color.parseColor(colorHex)
     paint.style = Paint.Style.FILL
     val centerX = width / 2f
-    val centerY = 130f
+    val centerY = 106f
     canvas.drawCircle(centerX, centerY, 20f, paint)
 
     paint.color = Color.WHITE
