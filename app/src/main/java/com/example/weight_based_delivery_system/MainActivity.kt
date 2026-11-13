@@ -250,10 +250,19 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
                     }
 
                     if (!success) {
+                        val errReason = result.exceptionOrNull()?.message ?: "Unknown error"
                         shiftState.routeStatus = RouteFetchStatus.UNAVAILABLE
-                        shiftState.routeSource = "Unavailable (Retry #$attempt in ${backoffMs / 1000}s)"
+                        shiftState.routeSource = "Unavailable: [$errReason] (Retry #$attempt in ${backoffMs / 1000}s)"
+                        Log.w("RouteLogger", "[RouteLogger] Rider: ${shiftState.driver.name} | Leg: $legName | Status: Unavailable | Reason: $errReason | Retry #$attempt in ${backoffMs / 1000}s")
                         delay(backoffMs)
-                        backoffMs = (backoffMs * 2).coerceAtMost(16000L) // Capped backoff at 16s
+                        
+                        val isRateOrForbidden = errReason.contains("HTTP 403") || errReason.contains("HTTP 429")
+                        val maxBackoff = if (isRateOrForbidden) 60000L else 16000L
+                        backoffMs = if (isRateOrForbidden) {
+                            if (backoffMs < 30000L) 30000L else (backoffMs * 2).coerceAtMost(maxBackoff)
+                        } else {
+                            (backoffMs * 2).coerceAtMost(maxBackoff)
+                        }
                     }
                 }
             }
@@ -856,7 +865,7 @@ fun ActiveDriverStatusCard(
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Text(
-                        text = "⚠️ Route Unavailable - Retrying with Backoff...",
+                        text = "⚠️ ${shiftState.routeSource}",
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.onErrorContainer,
