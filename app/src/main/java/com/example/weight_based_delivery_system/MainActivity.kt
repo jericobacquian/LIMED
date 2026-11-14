@@ -287,9 +287,19 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
                     } else {
                         val exception = result.exceptionOrNull()
                         if (exception is DeterministicRejectionException && runId == currentRunId) {
-                            parcel?.status = DeliveryStatus.SKIPPED
-                            val skipReason = "unreachable: route %.1fkm for %.1fm straight line".format(exception.routeLengthMeters / 1000.0, exception.straightDistMeters)
-                            shiftState.routeStatus = RouteFetchStatus.UNAVAILABLE
+                            val skipReason = if (exception.routeLengthMeters > 0.0) {
+                                "unreachable: route %.1fkm for %.1fm straight line".format(exception.routeLengthMeters / 1000.0, exception.straightDistMeters)
+                            } else {
+                                "unreachable: ${exception.message}"
+                            }
+                            val stopInfo = if (parcel != null) "Stop #${shiftState.currentParcelIndex + 1} (${parcel.name})" else "Return Leg"
+                            shiftState.skippedReasons.add("$stopInfo: $skipReason")
+
+                            if (parcel != null) {
+                                parcel.status = DeliveryStatus.SKIPPED
+                            }
+                            shiftState.routeStatus = RouteFetchStatus.LOADING
+                            shiftState.currentRoute = null
                             shiftState.routeSource = "Skipped: $skipReason"
                             Log.w("RouteLogger", "[RouteLogger] Rider: ${shiftState.driver.name} | Leg: $legName | STOP SKIPPED: $skipReason")
 
@@ -309,19 +319,56 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
                     }
 
                     if (!success && runId == currentRunId) {
-                        val errReason = result.exceptionOrNull()?.message ?: "Unknown error"
+                        val exception = result.exceptionOrNull()
+                        val errReason = exception?.message ?: "Unknown error"
+                        val isNetworkOrRateLimit = exception is java.net.SocketTimeoutException ||
+                                exception is java.net.UnknownHostException ||
+                                exception is java.net.ConnectException ||
+                                errReason.contains("SocketTimeoutException", ignoreCase = true) ||
+                                errReason.contains("UnknownHostException", ignoreCase = true) ||
+                                errReason.contains("ConnectException", ignoreCase = true) ||
+                                errReason.contains("HTTP 403", ignoreCase = true) ||
+                                errReason.contains("HTTP 429", ignoreCase = true) ||
+                                errReason.contains("HTTP 503", ignoreCase = true)
+
+                        if (!isNetworkOrRateLimit && attempt >= 5) {
+                            val capReason = "hard cap reached (failed 5 times: $errReason)"
+                            val stopInfo = if (parcel != null) "Stop #${shiftState.currentParcelIndex + 1} (${parcel.name})" else "Return Leg"
+                            shiftState.skippedReasons.add("$stopInfo: $capReason")
+                            Log.w("RouteLogger", "[RouteLogger] HARD CAP REACHED (5 retries) | Rider: ${shiftState.driver.name} | Leg: $legName | Reason: $errReason")
+
+                            if (parcel != null) {
+                                parcel.status = DeliveryStatus.SKIPPED
+                                shiftState.routeStatus = RouteFetchStatus.LOADING
+                                shiftState.currentRoute = null
+                                shiftState.routeSource = "Skipped: $capReason"
+
+                                shiftState.legStartLat = shiftState.currentLat
+                                shiftState.legStartLng = shiftState.currentLng
+                                shiftState.legSecondsElapsed = 0.0
+                                shiftState.currentParcelIndex += 1
+
+                                if (shiftState.currentParcel != null) {
+                                    shiftState.riderState = RiderState.EN_ROUTE
+                                } else {
+                                    shiftState.riderState = RiderState.RETURNING
+                                }
+                            } else {
+                                shiftState.riderState = RiderState.SHIFT_COMPLETED
+                                shiftState.currentLat = hubLat
+                                shiftState.currentLng = hubLng
+                                shiftState.routeStatus = RouteFetchStatus.UNAVAILABLE
+                                shiftState.routeSource = "Completed (Return Leg Failed 5x)"
+                            }
+                            success = true
+                            break
+                        }
+
                         shiftState.routeStatus = RouteFetchStatus.UNAVAILABLE
-                        shiftState.routeSource = "Unavailable: [$errReason] (Retry #$attempt in ${backoffMs / 1000}s)"
+                        shiftState.routeSource = if (isNetworkOrRateLimit) "No connection, retrying (#$attempt)" else "Unavailable: [$errReason] (Retry #$attempt in ${backoffMs / 1000}s)"
                         Log.w("RouteLogger", "[RouteLogger] Rider: ${shiftState.driver.name} | Leg: $legName | Status: Unavailable | Reason: $errReason | Retry #$attempt in ${backoffMs / 1000}s")
                         delay(backoffMs)
-                        
-                        val isRateOrForbidden = errReason.contains("HTTP 403") || errReason.contains("HTTP 429")
-                        val maxBackoff = if (isRateOrForbidden) 60000L else 16000L
-                        backoffMs = if (isRateOrForbidden) {
-                            if (backoffMs < 30000L) 30000L else (backoffMs * 2).coerceAtMost(maxBackoff)
-                        } else {
-                            (backoffMs * 2).coerceAtMost(maxBackoff)
-                        }
+                        backoffMs = (backoffMs * 2).coerceAtMost(30000L)
                     }
                 }
             }
@@ -1076,6 +1123,34 @@ fun ActiveDriverStatusCard(
                         modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                     )
                 }
+
+                if (shiftState.skippedReasons.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(
+                                MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f),
+                                shape = RoundedCornerShape(6.dp)
+                            )
+                            .padding(6.dp)
+                    ) {
+                        Text(
+                            text = "⚠️ Skipped Stops Reasons (${shiftState.skippedReasons.size}):",
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onErrorContainer
+                        )
+                        shiftState.skippedReasons.forEach { reason ->
+                            Text(
+                                text = " • $reason",
+                                fontSize = 9.sp,
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                maxLines = 2
+                            )
+                        }
+                    }
+                }
             } else {
                 Text(
                     text = "🎉 SHIFT COMPLETE! Returned to Nasugbu Hub.",
@@ -1614,6 +1689,7 @@ fun MapLibreView(
 
     var mapInstance by remember { mutableStateOf<MapLibreMap?>(null) }
     var routePolyline by remember { mutableStateOf<Polyline?>(null) }
+    var boundaryPolyline by remember { mutableStateOf<Polyline?>(null) }
     var targetDestMarker by remember { mutableStateOf<Marker?>(null) }
     val vehicleMarkers = remember { mutableStateMapOf<String, Marker>() }
     val activePolylines = remember { mutableStateListOf<Polyline>() }
@@ -1653,7 +1729,7 @@ fun MapLibreView(
                             .addAll(circlePoints)
                             .color(Color.parseColor("#4D1E88E5")) // Semi-transparent blue (~30% opacity)
                             .width(1.5f) // Thin
-                        mapboxMap.addPolyline(polylineOptions)
+                        boundaryPolyline = mapboxMap.addPolyline(polylineOptions)
                     }
 
                     // 2. Add Red Pin Marker for YTO Express Nasugbu Hub
@@ -1676,7 +1752,6 @@ fun MapLibreView(
 
     // 1. Active Leg Route Line & Target Destination Marker Updates
     LaunchedEffect(selectedDriverId, currentSelectedParcelId, activeShift?.isReturningToHub, activeShift?.routeStatus) {
-        // Requirement 1: Call routePolyline?.remove() and set routePolyline = null BEFORE mapInstance guard
         routePolyline?.remove()
         routePolyline = null
         targetDestMarker?.remove()
@@ -1684,15 +1759,26 @@ fun MapLibreView(
 
         val map = mapInstance ?: return@LaunchedEffect
 
-        // Requirement 2: Track every polyline in a list, and remove all of them before adding a new one
-        activePolylines.forEach { it.remove() }
-        activePolylines.clear()
-
         val shift = activeShift ?: return@LaunchedEffect
         val parcel = shift.currentParcel
         val legName = if (parcel != null) "Stop #${shift.currentParcelIndex + 1} (${parcel.name})" else "Return to Hub"
 
-        // Requirement 1: Restore destination marker whenever rider has a current parcel, regardless of routeStatus
+        // Item 2: Log MapLibre reported polylines size before cleanup
+        val totalPolylinesBefore = map.polylines.size
+        Log.d("RouteLogger", "[RouteLogger] MapLibre polylines.size before cleanup: $totalPolylinesBefore | Rider: ${shift.driver.name} | Leg: $legName")
+
+        // Item 2: Remove every polyline from map.polylines except boundaryPolyline
+        var removedCount = 0
+        map.polylines.toList().forEach { poly ->
+            if (poly != boundaryPolyline) {
+                map.removePolyline(poly)
+                removedCount++
+            }
+        }
+        activePolylines.clear()
+        Log.d("RouteLogger", "[RouteLogger] STRAY POLYLINES REMOVED: $removedCount | Rider: ${shift.driver.name} | Leg: $legName")
+
+        // Restore destination marker whenever rider has a current parcel
         if (parcel != null) {
             val targetPoint = LatLng(parcel.destinationLat, parcel.destinationLng)
             targetDestMarker = map.addMarker(
@@ -1703,19 +1789,16 @@ fun MapLibreView(
             )
         }
 
-        // Requirement 2: Draw route polyline only if routeStatus == READY and currentRoute != null
         if (shift.routeStatus != RouteFetchStatus.READY || shift.currentRoute == null) {
             return@LaunchedEffect
         }
 
-        // Requirement 2: Draw polyline only if rider has a current parcel or isReturningToHub
         if (parcel == null && !shift.isReturningToHub) {
             return@LaunchedEffect
         }
 
         val routePoints = shift.currentRoute!!.points
         if (routePoints.isNotEmpty()) {
-            // Requirement 2: Verify route belongs to current leg (threshold 400m). On mismatch, warn and draw in orange (#FF9800)
             val expectedEnd = if (parcel != null) LatLng(parcel.destinationLat, parcel.destinationLng) else pickupCenterLocation
             val startDistMeters = calculateDistanceKm(routePoints.first().latitude, routePoints.first().longitude, shift.legStartLat, shift.legStartLng) * 1000.0
             val endDistMeters = calculateDistanceKm(routePoints.last().latitude, routePoints.last().longitude, expectedEnd.latitude, expectedEnd.longitude) * 1000.0
@@ -1725,7 +1808,7 @@ fun MapLibreView(
                 Log.w("RouteLogger", "[RouteLogger] WARNING: Route mismatch for Rider: ${shift.driver.name} | Leg: $legName | Start distance (%.1fm) or End distance (%.1fm) exceeds 400m threshold.".format(startDistMeters, endDistMeters))
             }
 
-            val lineColorHex = if (isMismatch) "#FF9800" else "#1976D2" // Orange on mismatch, Solid Blue normally
+            val lineColorHex = if (isMismatch) "#FF9800" else "#1976D2"
             val routeOptions = PolylineOptions()
                 .addAll(routePoints)
                 .color(Color.parseColor(lineColorHex))
@@ -1737,23 +1820,28 @@ fun MapLibreView(
                 routePolyline = newPoly
             }
 
-            // Requirement 3 & 4: Logging under RouteLogger with meaningful active tracked polyline count
-            val firstPt = routePoints.first()
-            val lastPt = routePoints.last()
-            var maxSegmentMeters = 0.0
+            // Item 3: Log rider, leg, point count, longest segment index & endpoints (and 5 context points if >500m)
+            var maxSegDistMeters = 0.0
+            var maxSegIdx = 0
             for (i in 0 until routePoints.size - 1) {
                 val p1 = routePoints[i]
                 val p2 = routePoints[i + 1]
                 val segDist = calculateDistanceKm(p1.latitude, p1.longitude, p2.latitude, p2.longitude) * 1000.0
-                if (segDist > maxSegmentMeters) {
-                    maxSegmentMeters = segDist
+                if (segDist > maxSegDistMeters) {
+                    maxSegDistMeters = segDist
+                    maxSegIdx = i
                 }
             }
-            val activeTrackedCount = activePolylines.size
-            val logMsg = "[RouteLogger] Rider: ${shift.driver.name} | Leg: $legName | Points: ${routePoints.size} | First: (${firstPt.latitude}, ${firstPt.longitude}) | Last: (${lastPt.latitude}, ${lastPt.longitude}) | Longest Seg: %.1fm | Active Tracked Polylines: $activeTrackedCount".format(maxSegmentMeters)
-            Log.d("RouteLogger", logMsg)
-            if (maxSegmentMeters > 500.0) {
-                Log.w("RouteLogger", "[RouteLogger] WARNING: Longest segment (%.1fm) exceeds 500m for Rider: ${shift.driver.name} | Leg: $legName".format(maxSegmentMeters))
+
+            val pStart = routePoints[maxSegIdx]
+            val pEnd = routePoints[maxSegIdx + 1]
+            Log.d("RouteLogger", "[RouteLogger] Rider: ${shift.driver.name} | Leg: $legName | Points: ${routePoints.size} | Longest Seg Index: $maxSegIdx | Length: %.1fm | Endpoint 1: (${pStart.latitude}, ${pStart.longitude}) | Endpoint 2: (${pEnd.latitude}, ${pEnd.longitude})".format(maxSegDistMeters))
+
+            if (maxSegDistMeters > 500.0) {
+                val ctxStart = (maxSegIdx - 5).coerceAtLeast(0)
+                val ctxEnd = (maxSegIdx + 6).coerceAtMost(routePoints.size)
+                val ctxPtsStr = routePoints.subList(ctxStart, ctxEnd).joinToString(separator = "; ") { "(${it.latitude}, ${it.longitude})" }
+                Log.w("RouteLogger", "[RouteLogger] WARNING: Longest segment (%.1fm > 500m) at Index $maxSegIdx for Rider: ${shift.driver.name} | Leg: $legName | Context Points [$ctxStart..${ctxEnd - 1}]: $ctxPtsStr".format(maxSegDistMeters))
             }
         }
 
@@ -1765,6 +1853,63 @@ fun MapLibreView(
                 CameraUpdateFactory.newLatLngZoom(activePos, 11.2),
                 300
             )
+        }
+    }
+
+    // Item 4: 2-Second Periodic Point-to-Segment Distance Checker (Local Flat Approximation)
+    LaunchedEffect(selectedDriverId, runId) {
+        while (true) {
+            delay(2000)
+            val shift = activeShift ?: continue
+            val route = shift.currentRoute ?: continue
+            if (shift.routeStatus != RouteFetchStatus.READY) continue
+
+            val riderLat = shift.currentLat
+            val riderLng = shift.currentLng
+            val pts = route.points
+
+            if (pts.size >= 2) {
+                var minDistMeters = Double.MAX_VALUE
+                var nearestSegIdx = 0
+
+                val metersPerDegreeLat = 111139.0
+                val latRad = Math.toRadians(riderLat)
+                val metersPerDegreeLng = 111139.0 * kotlin.math.cos(latRad)
+
+                for (i in 0 until pts.size - 1) {
+                    val a = pts[i]
+                    val b = pts[i + 1]
+
+                    val vx = (b.longitude - a.longitude) * metersPerDegreeLng
+                    val vy = (b.latitude - a.latitude) * metersPerDegreeLat
+                    val wx = (riderLng - a.longitude) * metersPerDegreeLng
+                    val wy = (riderLat - a.latitude) * metersPerDegreeLat
+
+                    val vLenSq = vx * vx + vy * vy
+                    val distSeg = if (vLenSq == 0.0) {
+                        kotlin.math.sqrt(wx * wx + wy * wy)
+                    } else {
+                        val t = ((wx * vx + wy * vy) / vLenSq).coerceIn(0.0, 1.0)
+                        val projX = t * vx
+                        val projY = t * vy
+                        val dx = wx - projX
+                        val dy = wy - projY
+                        kotlin.math.sqrt(dx * dx + dy * dy)
+                    }
+
+                    if (distSeg < minDistMeters) {
+                        minDistMeters = distSeg
+                        nearestSegIdx = i
+                    }
+                }
+
+                // Log ONLY when point-to-segment distance is over 50 m to avoid flooding Logcat
+                if (minDistMeters > 50.0) {
+                    val pA = pts[nearestSegIdx]
+                    val pB = pts[nearestSegIdx + 1]
+                    Log.w("RouteLogger", "[RouteLogger] WARNING: Rider ${shift.driver.name} is %.1fm away from nearest route segment #$nearestSegIdx [(${pA.latitude}, ${pA.longitude}) -> (${pB.latitude}, ${pB.longitude})] (>50m threshold)! RiderPos: ($riderLat, $riderLng)".format(minDistMeters))
+                }
+            }
         }
     }
 
