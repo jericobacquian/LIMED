@@ -28,6 +28,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -92,6 +93,7 @@ import androidx.core.graphics.createBitmap
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import com.example.weight_based_delivery_system.data.DeliveryDriver
+import com.example.weight_based_delivery_system.data.DeterministicRejectionException
 import com.example.weight_based_delivery_system.data.DeliveryRepository
 import com.example.weight_based_delivery_system.data.DeliveryStatus
 import com.example.weight_based_delivery_system.data.DriverShiftState
@@ -150,17 +152,8 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
 
     // State for Daily Dispatch Parcels (Random 350 to 500 items, sorted Heaviest & Farthest First)
     val dailyDispatchParcels = remember { mutableStateListOf<ParcelItem>() }
-
-    fun refreshDailyDispatch() {
-        dailyDispatchParcels.clear()
-        dailyDispatchParcels.addAll(DeliveryRepository.generateDailyDispatch(context))
-    }
-
-    LaunchedEffect(Unit) {
-        if (dailyDispatchParcels.isEmpty()) {
-            refreshDailyDispatch()
-        }
-    }
+    var currentRunSeed by remember { mutableStateOf(DeliveryRepository.DEMO_SEED ?: System.currentTimeMillis()) }
+    var runId by remember { mutableStateOf(0L) }
 
     // Load Drivers AFTER repository master pool is populated
     val drivers = remember(dailyDispatchParcels.size) { DeliveryRepository.getDrivers(context) }
@@ -203,6 +196,42 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
     var isBottomSheetOpen by remember { mutableStateOf(false) }
     var detailParcelItem by remember { mutableStateOf<ParcelItem?>(null) }
 
+    fun refreshDailyDispatch() {
+        val newSeed = DeliveryRepository.DEMO_SEED ?: System.currentTimeMillis()
+        currentRunSeed = newSeed
+        runId++
+        Log.d("DeliverySim", "Refreshing simulation. Run seed: $newSeed, Run ID: $runId")
+
+        simSecondsElapsed = 0
+        isPaused = false
+        showDriverInfoPanel = false
+        showBranchInfoPanel = false
+        isBottomSheetOpen = false
+        detailParcelItem = null
+
+        dailyDispatchParcels.clear()
+        val newDispatch = DeliveryRepository.generateDailyDispatch(context, newSeed)
+        dailyDispatchParcels.addAll(newDispatch)
+
+        driverShiftStates.clear()
+        drivers.forEach { driver ->
+            val queue = dailyDispatchParcels.filter { it.assignedDriver.id == driver.id }
+            driverShiftStates.add(
+                DriverShiftState(
+                    driver = driver,
+                    parcelQueue = queue
+                )
+            )
+        }
+        selectedDriverId = drivers.firstOrNull()?.id ?: ""
+    }
+
+    LaunchedEffect(Unit) {
+        if (dailyDispatchParcels.isEmpty()) {
+            refreshDailyDispatch()
+        }
+    }
+
     // Asynchronously fetch OSRM turn-by-turn road routes for each rider's active leg with retry & backoff
     driverShiftStates.forEach { shiftState ->
         val parcel = shiftState.currentParcel
@@ -210,13 +239,16 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
         val destLng = parcel?.destinationLng ?: hubLng
         val legName = if (parcel != null) "Stop #${shiftState.currentParcelIndex + 1} (${parcel.name})" else "Return to Hub"
 
-        LaunchedEffect(shiftState.driver.id, shiftState.currentParcelIndex, shiftState.riderState) {
+        val currentRunId = runId
+        LaunchedEffect(runId, shiftState.driver.id, shiftState.currentParcelIndex, shiftState.riderState) {
+            if (runId != currentRunId) return@LaunchedEffect
             if (shiftState.riderState == RiderState.EN_ROUTE || shiftState.riderState == RiderState.RETURNING) {
                 var backoffMs = 1000L
                 var attempt = 0
                 var success = false
 
                 while (!success && (shiftState.riderState == RiderState.EN_ROUTE || shiftState.riderState == RiderState.RETURNING)) {
+                    if (runId != currentRunId) return@LaunchedEffect
                     attempt++
                     shiftState.retryCount = attempt
                     shiftState.routeStatus = RouteFetchStatus.LOADING
@@ -229,12 +261,17 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
                         startLng = shiftState.legStartLng,
                         destLat = destLat,
                         destLng = destLng,
-                        vehicleType = shiftState.driver.vehicleType
+                        vehicleType = shiftState.driver.vehicleType,
+                        currentLat = shiftState.currentLat,
+                        currentLng = shiftState.currentLng,
+                        runId = runId
                     )
+
+                    if (runId != currentRunId) return@LaunchedEffect
 
                     if (result.isSuccess) {
                         val route = result.getOrNull()
-                        if (route != null) {
+                        if (route != null && runId == currentRunId) {
                             shiftState.currentRoute = route
                             shiftState.routeStatus = RouteFetchStatus.READY
                             val isCache = RouteCacheManager.get(
@@ -247,9 +284,31 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
                             shiftState.routeSource = if (isCache) "Cache (${route.points.size} pts)" else "OSRM (${route.points.size} pts)"
                             success = true
                         }
+                    } else {
+                        val exception = result.exceptionOrNull()
+                        if (exception is DeterministicRejectionException && runId == currentRunId) {
+                            parcel?.status = DeliveryStatus.SKIPPED
+                            val skipReason = "unreachable: route %.1fkm for %.1fm straight line".format(exception.routeLengthMeters / 1000.0, exception.straightDistMeters)
+                            shiftState.routeStatus = RouteFetchStatus.UNAVAILABLE
+                            shiftState.routeSource = "Skipped: $skipReason"
+                            Log.w("RouteLogger", "[RouteLogger] Rider: ${shiftState.driver.name} | Leg: $legName | STOP SKIPPED: $skipReason")
+
+                            // Advance rider to next stop from rider's current position
+                            shiftState.legStartLat = shiftState.currentLat
+                            shiftState.legStartLng = shiftState.currentLng
+                            shiftState.legSecondsElapsed = 0.0
+                            shiftState.currentParcelIndex += 1
+
+                            if (shiftState.currentParcel != null) {
+                                shiftState.riderState = RiderState.EN_ROUTE
+                            } else {
+                                shiftState.riderState = RiderState.RETURNING
+                            }
+                            success = true
+                        }
                     }
 
-                    if (!success) {
+                    if (!success && runId == currentRunId) {
                         val errReason = result.exceptionOrNull()?.message ?: "Unknown error"
                         shiftState.routeStatus = RouteFetchStatus.UNAVAILABLE
                         shiftState.routeSource = "Unavailable: [$errReason] (Retry #$attempt in ${backoffMs / 1000}s)"
@@ -270,7 +329,7 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
     }
 
     // Central 6:00 AM Real-World Simulation Engine (Speed + Unloading Delays + Traffic + Return Trip to Hub)
-    LaunchedEffect(isPaused, simSpeedMultiplier, dailyDispatchParcels.size) {
+    LaunchedEffect(runId, isPaused, simSpeedMultiplier, dailyDispatchParcels.size) {
         activeSimLoopCount++
         Log.d("SimEngine", "Started simulation loop. Active loop count: $activeSimLoopCount")
 
@@ -420,19 +479,21 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
             modifier = Modifier.fillMaxSize(),
             driverShiftStates = driverShiftStates,
             selectedDriverId = selectedDriverId,
-            simSecondsElapsed = simSecondsElapsed
+            simSecondsElapsed = simSecondsElapsed,
+            runId = runId
         )
 
         // 🌅 SLEEK INTEGRATED TOP FLOATING HEADER PILL BAR
         SleekHeaderPillBar(
             modifier = Modifier
                 .align(Alignment.TopCenter)
-                .padding(top = 16.dp, start = 16.dp, end = 16.dp),
+                .padding(top = 36.dp, start = 16.dp, end = 16.dp),
             simSecondsElapsed = simSecondsElapsed,
             speedMultiplier = simSpeedMultiplier,
             isPaused = isPaused,
             isRushHour = isRushHour,
             activeShift = activeSelectedShift,
+            runSeed = currentRunSeed,
             onTogglePause = { isPaused = !isPaused },
             onCycleSpeed = {
                 simSpeedMultiplier = when (simSpeedMultiplier) {
@@ -582,6 +643,8 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
     }
 }
 
+const val SHOW_SEED = true
+
 @Composable
 fun SleekHeaderPillBar(
     modifier: Modifier = Modifier,
@@ -590,13 +653,24 @@ fun SleekHeaderPillBar(
     isPaused: Boolean,
     isRushHour: Boolean,
     activeShift: DriverShiftState?,
+    runSeed: Long,
     onTogglePause: () -> Unit,
     onCycleSpeed: () -> Unit
 ) {
+    val context = LocalContext.current
+    val clipboardManager = androidx.compose.ui.platform.LocalClipboardManager.current
+
     val totalMins = simSecondsElapsed / 60
-    val hours = 6 + (totalMins / 60)
-    val mins = totalMins % 60
-    val clockStr = "%02d:%02d AM".format(if (hours > 12) hours - 12 else hours, mins)
+    val totalMinsFromMidnight = 360 + totalMins // 6:00 AM start
+    val totalHoursFromMidnight = (totalMinsFromMidnight / 60) % 24
+    val mins = totalMinsFromMidnight % 60
+    val hour12 = when {
+        totalHoursFromMidnight == 0 -> 12
+        totalHoursFromMidnight > 12 -> totalHoursFromMidnight - 12
+        else -> totalHoursFromMidnight
+    }
+    val amPm = if (totalHoursFromMidnight < 12) "AM" else "PM"
+    val clockStr = "%02d:%02d %s".format(hour12, mins, amPm)
 
     Surface(
         modifier = modifier.fillMaxWidth(),
@@ -604,59 +678,72 @@ fun SleekHeaderPillBar(
         color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.95f),
         shadowElevation = 6.dp
     ) {
-        Row(
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 14.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
-            // Clock & Traffic Badge
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text = "🌅 $clockStr",
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.ExtraBold,
-                    color = MaterialTheme.colorScheme.onSurface
-                )
-                if (isRushHour) {
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Surface(
-                        color = MaterialTheme.colorScheme.errorContainer,
-                        shape = RoundedCornerShape(4.dp)
-                    ) {
-                        Text(
-                            text = "🚦 Rush Hour",
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = MaterialTheme.colorScheme.onErrorContainer,
-                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
-                        )
+            // Row 1: Clock (left), Active Driver Name (center, weight 1f), Speed & Close Buttons (right)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                // Clock & Traffic Badge
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Text(
+                        text = "🌅 $clockStr",
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.ExtraBold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    if (isRushHour) {
+                        Surface(
+                            color = MaterialTheme.colorScheme.errorContainer,
+                            shape = RoundedCornerShape(4.dp)
+                        ) {
+                            Text(
+                                text = "🚦 Rush",
+                                fontSize = 9.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                                modifier = Modifier.padding(horizontal = 3.dp, vertical = 2.dp)
+                            )
+                        }
                     }
                 }
-            }
 
-            // Active Driver Name
-            activeShift?.let { shift ->
-                Text(
-                    text = "🚚 ${shift.driver.name}",
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.primary,
-                    maxLines = 1,
-                    softWrap = false
-                )
-            }
+                // Active Driver Name (weight 1f, Ellipsis)
+                activeShift?.let { shift ->
+                    Text(
+                        text = "🚚 ${shift.driver.name}",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary,
+                        maxLines = 1,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(horizontal = 4.dp)
+                    )
+                } ?: Spacer(modifier = Modifier.weight(1f))
 
-            // Speed & Play Controls
-            Row(verticalAlignment = Alignment.CenterVertically) {
+                // Speed Button (min 40dp touch target)
                 Surface(
                     color = MaterialTheme.colorScheme.primaryContainer,
                     shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier.clickable { onCycleSpeed() }
+                    modifier = Modifier
+                        .heightIn(min = 40.dp)
+                        .clickable { onCycleSpeed() }
                 ) {
                     Row(
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                        modifier = Modifier
+                            .padding(horizontal = 8.dp)
+                            .heightIn(min = 40.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Icon(
@@ -675,13 +762,43 @@ fun SleekHeaderPillBar(
                     }
                 }
 
-                Spacer(modifier = Modifier.width(4.dp))
+                // Pause / Close Button (min 40dp touch target)
+                Box(
+                    modifier = Modifier.size(40.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    IconButton(
+                        onClick = onTogglePause,
+                        modifier = Modifier.size(40.dp)
+                    ) {
+                        Icon(
+                            imageVector = if (isPaused) Icons.Default.PlayArrow else Icons.Default.Close,
+                            contentDescription = "Pause/Play",
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                }
+            }
 
-                IconButton(onClick = onTogglePause, modifier = Modifier.size(28.dp)) {
-                    Icon(
-                        imageVector = if (isPaused) Icons.Default.PlayArrow else Icons.Default.Close,
-                        contentDescription = "Pause",
-                        tint = MaterialTheme.colorScheme.primary
+            // Row 2 (Secondary): Seed info (tappable to copy)
+            if (SHOW_SEED) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable {
+                            clipboardManager.setText(androidx.compose.ui.text.AnnotatedString(runSeed.toString()))
+                            android.widget.Toast.makeText(context, "Seed copied", android.widget.Toast.LENGTH_SHORT).show()
+                        }
+                        .padding(vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "🌱 Seed: $runSeed (Tap to copy)",
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                        maxLines = 1,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
                     )
                 }
             }
@@ -932,7 +1049,7 @@ fun ActiveDriverStatusCard(
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Text(
-                        text = "Remaining Payload: %.1f kg".format(shiftState.currentPayloadWeightKg),
+                        text = "Payload: %.1f kg | Skipped: ${shiftState.skippedCount}".format(shiftState.currentPayloadWeightKg),
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.onPrimaryContainer
@@ -1021,6 +1138,7 @@ fun ActiveDriverStatusCard(
                             DeliveryStatus.DELIVERED -> "✅"
                             DeliveryStatus.IN_TRANSIT -> "🚚"
                             DeliveryStatus.PENDING -> "⏳"
+                            DeliveryStatus.SKIPPED -> "⚠️"
                         }
                         Row(
                             modifier = Modifier
@@ -1478,12 +1596,15 @@ fun ParcelDetailView(
     }
 }
 
+const val SHOW_BOUNDARY_CIRCLE = true
+
 @Composable
 fun MapLibreView(
     modifier: Modifier = Modifier,
     driverShiftStates: List<DriverShiftState>,
     selectedDriverId: String,
-    simSecondsElapsed: Int
+    simSecondsElapsed: Int,
+    runId: Long
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -1495,11 +1616,24 @@ fun MapLibreView(
     var routePolyline by remember { mutableStateOf<Polyline?>(null) }
     var targetDestMarker by remember { mutableStateOf<Marker?>(null) }
     val vehicleMarkers = remember { mutableStateMapOf<String, Marker>() }
+    val activePolylines = remember { mutableStateListOf<Polyline>() }
 
     // Memory Tracker & LRU Cache for Callout Bitmaps
     val calloutBitmapCache = remember { LruCache<String, Bitmap>(30) }
     val lastCalloutTextMap = remember { mutableMapOf<String, String>() }
     val lastCamPos = remember { mutableStateOf<LatLng?>(null) }
+
+    LaunchedEffect(runId, driverShiftStates) {
+        routePolyline?.remove()
+        routePolyline = null
+        targetDestMarker?.remove()
+        targetDestMarker = null
+        activePolylines.forEach { it.remove() }
+        activePolylines.clear()
+        vehicleMarkers.values.forEach { it.remove() }
+        vehicleMarkers.clear()
+        calloutBitmapCache.evictAll()
+    }
 
     val mapView = remember {
         MapView(context).apply {
@@ -1512,13 +1646,15 @@ fun MapLibreView(
                         2000
                     )
 
-                    // 1. Draw 20km Outer Line Barrier ONLY
-                    val circlePoints = createGeodesicCircle(pickupCenterLocation, coverageRadiusKm)
-                    val polylineOptions = PolylineOptions()
-                        .addAll(circlePoints)
-                        .color(Color.parseColor("#1E88E5"))
-                        .width(4.0f)
-                    mapboxMap.addPolyline(polylineOptions)
+                    // 1. Draw 20km Outer Line Barrier ONLY if SHOW_BOUNDARY_CIRCLE is true (Thin, Semi-transparent)
+                    if (SHOW_BOUNDARY_CIRCLE) {
+                        val circlePoints = createGeodesicCircle(pickupCenterLocation, coverageRadiusKm)
+                        val polylineOptions = PolylineOptions()
+                            .addAll(circlePoints)
+                            .color(Color.parseColor("#4D1E88E5")) // Semi-transparent blue (~30% opacity)
+                            .width(1.5f) // Thin
+                        mapboxMap.addPolyline(polylineOptions)
+                    }
 
                     // 2. Add Red Pin Marker for YTO Express Nasugbu Hub
                     val markerIcon = IconFactory.getInstance(context).fromBitmap(createCustomMarkerBitmap())
@@ -1540,39 +1676,84 @@ fun MapLibreView(
 
     // 1. Active Leg Route Line & Target Destination Marker Updates
     LaunchedEffect(selectedDriverId, currentSelectedParcelId, activeShift?.isReturningToHub, activeShift?.routeStatus) {
-        val map = mapInstance ?: return@LaunchedEffect
-        val shift = activeShift ?: return@LaunchedEffect
-
+        // Requirement 1: Call routePolyline?.remove() and set routePolyline = null BEFORE mapInstance guard
         routePolyline?.remove()
+        routePolyline = null
         targetDestMarker?.remove()
+        targetDestMarker = null
 
+        val map = mapInstance ?: return@LaunchedEffect
+
+        // Requirement 2: Track every polyline in a list, and remove all of them before adding a new one
+        activePolylines.forEach { it.remove() }
+        activePolylines.clear()
+
+        val shift = activeShift ?: return@LaunchedEffect
         val parcel = shift.currentParcel
+        val legName = if (parcel != null) "Stop #${shift.currentParcelIndex + 1} (${parcel.name})" else "Return to Hub"
+
+        // Requirement 1: Restore destination marker whenever rider has a current parcel, regardless of routeStatus
         if (parcel != null) {
             val targetPoint = LatLng(parcel.destinationLat, parcel.destinationLng)
-
-            // Add Target Customer Destination Pin Marker
             targetDestMarker = map.addMarker(
                 MarkerOptions()
                     .position(targetPoint)
                     .title("Target Stop #${shift.currentParcelIndex + 1}: ${parcel.customerName}")
                     .snippet("${parcel.name} (${parcel.weightKg} kg)")
             )
+        }
 
-            if (shift.routeStatus == RouteFetchStatus.READY && shift.currentRoute != null) {
-                val routeOptions = PolylineOptions()
-                    .addAll(shift.currentRoute!!.points)
-                    .color(Color.parseColor("#1976D2")) // Solid Vibrant Blue OSRM Road Polyline
-                    .width(3.0f)
-                routePolyline = map.addPolyline(routeOptions)
+        // Requirement 2: Draw route polyline only if routeStatus == READY and currentRoute != null
+        if (shift.routeStatus != RouteFetchStatus.READY || shift.currentRoute == null) {
+            return@LaunchedEffect
+        }
+
+        // Requirement 2: Draw polyline only if rider has a current parcel or isReturningToHub
+        if (parcel == null && !shift.isReturningToHub) {
+            return@LaunchedEffect
+        }
+
+        val routePoints = shift.currentRoute!!.points
+        if (routePoints.isNotEmpty()) {
+            // Requirement 2: Verify route belongs to current leg (threshold 400m). On mismatch, warn and draw in orange (#FF9800)
+            val expectedEnd = if (parcel != null) LatLng(parcel.destinationLat, parcel.destinationLng) else pickupCenterLocation
+            val startDistMeters = calculateDistanceKm(routePoints.first().latitude, routePoints.first().longitude, shift.legStartLat, shift.legStartLng) * 1000.0
+            val endDistMeters = calculateDistanceKm(routePoints.last().latitude, routePoints.last().longitude, expectedEnd.latitude, expectedEnd.longitude) * 1000.0
+
+            val isMismatch = startDistMeters > 400.0 || endDistMeters > 400.0
+            if (isMismatch) {
+                Log.w("RouteLogger", "[RouteLogger] WARNING: Route mismatch for Rider: ${shift.driver.name} | Leg: $legName | Start distance (%.1fm) or End distance (%.1fm) exceeds 400m threshold.".format(startDistMeters, endDistMeters))
             }
-        } else if (shift.isReturningToHub) {
-            // Return leg to Nasugbu Hub
-            if (shift.routeStatus == RouteFetchStatus.READY && shift.currentRoute != null) {
-                val routeOptions = PolylineOptions()
-                    .addAll(shift.currentRoute!!.points)
-                    .color(Color.parseColor("#1976D2"))
-                    .width(3.0f)
-                routePolyline = map.addPolyline(routeOptions)
+
+            val lineColorHex = if (isMismatch) "#FF9800" else "#1976D2" // Orange on mismatch, Solid Blue normally
+            val routeOptions = PolylineOptions()
+                .addAll(routePoints)
+                .color(Color.parseColor(lineColorHex))
+                .width(3.0f)
+            
+            val newPoly = map.addPolyline(routeOptions)
+            if (newPoly != null) {
+                activePolylines.add(newPoly)
+                routePolyline = newPoly
+            }
+
+            // Requirement 3 & 4: Logging under RouteLogger with meaningful active tracked polyline count
+            val firstPt = routePoints.first()
+            val lastPt = routePoints.last()
+            var maxSegmentMeters = 0.0
+            for (i in 0 until routePoints.size - 1) {
+                val p1 = routePoints[i]
+                val p2 = routePoints[i + 1]
+                val segDist = calculateDistanceKm(p1.latitude, p1.longitude, p2.latitude, p2.longitude) * 1000.0
+                if (segDist > maxSegmentMeters) {
+                    maxSegmentMeters = segDist
+                }
+            }
+            val activeTrackedCount = activePolylines.size
+            val logMsg = "[RouteLogger] Rider: ${shift.driver.name} | Leg: $legName | Points: ${routePoints.size} | First: (${firstPt.latitude}, ${firstPt.longitude}) | Last: (${lastPt.latitude}, ${lastPt.longitude}) | Longest Seg: %.1fm | Active Tracked Polylines: $activeTrackedCount".format(maxSegmentMeters)
+            Log.d("RouteLogger", logMsg)
+            if (maxSegmentMeters > 500.0) {
+                Log.w("RouteLogger", "[RouteLogger] WARNING: Longest segment (%.1fm) exceeds 500m for Rider: ${shift.driver.name} | Leg: $legName".format(maxSegmentMeters))
             }
         }
 
