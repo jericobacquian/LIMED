@@ -79,7 +79,9 @@ import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -142,15 +144,18 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+const val SHOW_GENERATOR_BUTTON = true
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DeliveryDashboard(modifier: Modifier = Modifier) {
     val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
 
     val hubLat = 14.0657415
     val hubLng = 120.6334763
 
-    // State for Daily Dispatch Parcels (Random 350 to 500 items, sorted Heaviest & Farthest First)
+    // State for Daily Dispatch Parcels (Per-rider sampling: 40 to 70 items per rider)
     val dailyDispatchParcels = remember { mutableStateListOf<ParcelItem>() }
     var currentRunSeed by remember { mutableStateOf(DeliveryRepository.DEMO_SEED ?: System.currentTimeMillis()) }
     var runId by remember { mutableStateOf(0L) }
@@ -589,6 +594,21 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
             verticalArrangement = Arrangement.spacedBy(12.dp),
             horizontalAlignment = Alignment.End
         ) {
+            // 0. Debug Generator Button (Run Once)
+            if (SHOW_GENERATOR_BUTTON) {
+                SmallFloatingActionButton(
+                    onClick = {
+                        coroutineScope.launch {
+                            DeliveryRepository.generateAndSaveCustomerLocations(context)
+                        }
+                    },
+                    containerColor = MaterialTheme.colorScheme.errorContainer,
+                    contentColor = MaterialTheme.colorScheme.onErrorContainer
+                ) {
+                    Icon(Icons.Default.Info, contentDescription = "Gen Locations")
+                }
+            }
+
             // 1. Refresh / New Delivery Day Button
             SmallFloatingActionButton(
                 onClick = {
