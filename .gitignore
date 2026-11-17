@@ -1,15 +1,18 @@
+# Local configuration file (sdk path, etc)
+local.properties
+
+# IDE and Project settings
+.idea/
 *.iml
-.gradle
-/local.properties
-/.idea/caches
-/.idea/libraries
-/.idea/modules.xml
-/.idea/workspace.xml
-/.idea/navEditor.xml
-/.idea/assetWizardSettings.xml
-.DS_Store
-/build
+
+# Build outputs and cache directories
+build/
+.gradle/
 /captures
 .externalNativeBuild
 .cxx
-local.properties
+.DS_Store
+
+# Explicitly ensure mandatory tracked directories are kept
+!app/src/main/assets/
+!gradle/wrapper/

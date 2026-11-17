@@ -1093,7 +1093,7 @@ fun ActiveDriverStatusCard(
             } else if (parcel != null) {
                 // Active Leg Tracking Info
                 Text(
-                    text = "🚚 Active Leg: Rider Position ➔ Stop #$currentStopNum (${parcel.name})",
+                    text = "🚚 Active Leg: Rider Position ➔ Stop #$currentStopNum (${parcel.name} - ₱%,.2f)".format(parcel.pricePhp),
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.onPrimaryContainer,
@@ -1337,6 +1337,7 @@ fun ParcelTrackerSheetContent(
     val filteredParcels = remember(searchQuery, selectedVehicleFilter, parcels) {
         parcels.filter { item ->
             val matchesSearch = item.name.contains(searchQuery, ignoreCase = true) ||
+                    item.customerName.contains(searchQuery, ignoreCase = true) ||
                     item.brand.contains(searchQuery, ignoreCase = true) ||
                     item.id.contains(searchQuery, ignoreCase = true) ||
                     item.assignedDriver.name.contains(searchQuery, ignoreCase = true)
@@ -1386,7 +1387,7 @@ fun ParcelTrackerSheetContent(
                 value = searchQuery,
                 onValueChange = { searchQuery = it },
                 modifier = Modifier.fillMaxWidth(),
-                placeholder = { Text("Search by parcel, brand, driver...") },
+                placeholder = { Text("Search by customer, parcel, brand, driver...") },
                 leadingIcon = { Icon(Icons.Default.Search, contentDescription = "Search") },
                 shape = RoundedCornerShape(12.dp)
             )
@@ -1519,9 +1520,17 @@ fun ParcelItemCard(
                 Spacer(modifier = Modifier.height(2.dp))
 
                 Text(
-                    text = "Brand: ${parcel.brand} | Driver: ${parcel.assignedDriver.name}",
+                    text = "Customer: ${parcel.customerName} | Brand: ${parcel.brand}",
                     fontSize = 12.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1
+                )
+
+                Text(
+                    text = "Price: ₱%,.2f | Driver: ${parcel.assignedDriver.name}".format(parcel.pricePhp),
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.primary,
                     maxLines = 1
                 )
 
@@ -1582,6 +1591,7 @@ fun ParcelDetailView(
                     fontWeight = FontWeight.Bold,
                     fontSize = 16.sp
                 )
+                Text(text = "Customer: ${parcel.customerName}", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                 Text(text = "Brand: ${parcel.brand} | Category: ${parcel.category}", fontSize = 13.sp)
                 Spacer(modifier = Modifier.height(6.dp))
                 Row(
@@ -1589,7 +1599,7 @@ fun ParcelDetailView(
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Text(
-                        text = "Weight: ${parcel.weightKg} kg",
+                        text = "Weight: ${parcel.weightKg} kg | Price: ₱%,.2f".format(parcel.pricePhp),
                         fontWeight = FontWeight.Bold,
                         color = MaterialTheme.colorScheme.primary
                     )
