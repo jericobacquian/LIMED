@@ -19,6 +19,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -107,6 +108,8 @@ import com.example.weight_based_delivery_system.data.RouteCacheManager
 import com.example.weight_based_delivery_system.data.RouteFetchStatus
 import com.example.weight_based_delivery_system.data.VehicleType
 import com.example.weight_based_delivery_system.data.calculateDistanceKm
+import com.example.weight_based_delivery_system.data.calculateParcelEta
+import com.example.weight_based_delivery_system.data.getTrafficFactor
 import com.example.weight_based_delivery_system.data.interpolateAlongRoute
 import com.example.weight_based_delivery_system.data.osrmProfile
 import com.example.weight_based_delivery_system.ui.theme.Weight_based_delivery_systemTheme
@@ -392,7 +395,7 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
                 simSecondsElapsed += stepSeconds
 
                 // Traffic Factor: 25% speed reduction during 07:30 AM - 09:00 AM Rush Hour
-                val trafficFactor = if (simSecondsElapsed in 5400..10800) 0.75 else 1.0
+                val trafficFactor = getTrafficFactor(simSecondsElapsed)
 
                 driverShiftStates.forEach { shiftState ->
                     val parcel = shiftState.currentParcel
@@ -694,6 +697,8 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
             ) {
                 ParcelTrackerSheetContent(
                     parcels = dailyDispatchParcels,
+                    driverShiftStates = driverShiftStates,
+                    simSecondsElapsed = simSecondsElapsed,
                     selectedParcel = detailParcelItem,
                     onSelectParcel = { parcel ->
                         detailParcelItem = parcel
@@ -1325,6 +1330,8 @@ fun DriverSelectorBar(
 @Composable
 fun ParcelTrackerSheetContent(
     parcels: List<ParcelItem>,
+    driverShiftStates: List<DriverShiftState>,
+    simSecondsElapsed: Int,
     selectedParcel: ParcelItem?,
     onSelectParcel: (ParcelItem) -> Unit,
     onFocusDriverOnMap: (String) -> Unit,
@@ -1334,12 +1341,15 @@ fun ParcelTrackerSheetContent(
     var selectedVehicleFilter by remember { mutableStateOf<VehicleType?>(null) }
     var currentDetailItem by remember { mutableStateOf(selectedParcel) }
 
+    val trafficFactor = getTrafficFactor(simSecondsElapsed)
+
     val filteredParcels = remember(searchQuery, selectedVehicleFilter, parcels) {
         parcels.filter { item ->
-            val matchesSearch = item.name.contains(searchQuery, ignoreCase = true) ||
+            val matchesSearch = item.id.contains(searchQuery, ignoreCase = true) ||
+                    item.name.contains(searchQuery, ignoreCase = true) ||
                     item.customerName.contains(searchQuery, ignoreCase = true) ||
+                    item.destinationAddress.contains(searchQuery, ignoreCase = true) ||
                     item.brand.contains(searchQuery, ignoreCase = true) ||
-                    item.id.contains(searchQuery, ignoreCase = true) ||
                     item.assignedDriver.name.contains(searchQuery, ignoreCase = true)
             val matchesFilter = selectedVehicleFilter == null || item.assignedDriver.vehicleType == selectedVehicleFilter
             matchesSearch && matchesFilter
@@ -1353,9 +1363,13 @@ fun ParcelTrackerSheetContent(
             .padding(16.dp)
     ) {
         if (currentDetailItem != null) {
+            val shiftState = driverShiftStates.firstOrNull { it.driver.id == currentDetailItem!!.assignedDriver.id }
             // Detailed View of Selected Parcel
             ParcelDetailView(
                 parcel = currentDetailItem!!,
+                shiftState = shiftState,
+                simSecondsElapsed = simSecondsElapsed,
+                trafficFactor = trafficFactor,
                 onBack = { currentDetailItem = null },
                 onFocusDriverOnMap = {
                     onFocusDriverOnMap(currentDetailItem!!.assignedDriver.id)
@@ -1387,14 +1401,14 @@ fun ParcelTrackerSheetContent(
                 value = searchQuery,
                 onValueChange = { searchQuery = it },
                 modifier = Modifier.fillMaxWidth(),
-                placeholder = { Text("Search by customer, parcel, brand, driver...") },
+                placeholder = { Text("Search by ID, parcel, customer, area...") },
                 leadingIcon = { Icon(Icons.Default.Search, contentDescription = "Search") },
                 shape = RoundedCornerShape(12.dp)
             )
 
             Spacer(modifier = Modifier.height(8.dp))
 
-            // Vehicle Type Filter Chips in a horizontal scrollable row to prevent vertical wrapping
+            // Vehicle Type Filter Chips in a horizontal scrollable row
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1431,8 +1445,10 @@ fun ParcelTrackerSheetContent(
                 modifier = Modifier.fillMaxWidth()
             ) {
                 items(filteredParcels) { parcel ->
+                    val shiftState = driverShiftStates.firstOrNull { it.driver.id == parcel.assignedDriver.id }
                     ParcelItemCard(
                         parcel = parcel,
+                        shiftState = shiftState,
                         onClick = {
                             onSelectParcel(parcel)
                             currentDetailItem = parcel
@@ -1447,8 +1463,43 @@ fun ParcelTrackerSheetContent(
 @Composable
 fun ParcelItemCard(
     parcel: ParcelItem,
+    shiftState: DriverShiftState?,
     onClick: () -> Unit
 ) {
+    val statusChipText: String
+    val statusChipColor: androidx.compose.ui.graphics.Color
+    val statusContentColor: androidx.compose.ui.graphics.Color
+
+    val isUnloadingCurrent = shiftState?.isUnloading == true && shiftState.currentParcel?.id == parcel.id
+
+    when {
+        parcel.status == DeliveryStatus.DELIVERED -> {
+            statusChipText = "Delivered"
+            statusChipColor = androidx.compose.ui.graphics.Color(0xFF2E7D32)
+            statusContentColor = androidx.compose.ui.graphics.Color.White
+        }
+        parcel.status == DeliveryStatus.SKIPPED -> {
+            statusChipText = "Skipped"
+            statusChipColor = MaterialTheme.colorScheme.errorContainer
+            statusContentColor = MaterialTheme.colorScheme.onErrorContainer
+        }
+        isUnloadingCurrent -> {
+            statusChipText = "Unloading"
+            statusChipColor = MaterialTheme.colorScheme.tertiaryContainer
+            statusContentColor = MaterialTheme.colorScheme.onTertiaryContainer
+        }
+        parcel.status == DeliveryStatus.IN_TRANSIT -> {
+            statusChipText = "Out for delivery"
+            statusChipColor = MaterialTheme.colorScheme.secondaryContainer
+            statusContentColor = MaterialTheme.colorScheme.onSecondaryContainer
+        }
+        else -> {
+            statusChipText = "Queued"
+            statusChipColor = MaterialTheme.colorScheme.primaryContainer
+            statusContentColor = MaterialTheme.colorScheme.onPrimaryContainer
+        }
+    }
+
     Card(
         modifier = Modifier
             .fillMaxWidth()
@@ -1501,14 +1552,14 @@ fun ParcelItemCard(
                     )
                     Spacer(modifier = Modifier.width(6.dp))
                     Surface(
-                        color = MaterialTheme.colorScheme.primary,
+                        color = statusChipColor,
                         shape = RoundedCornerShape(6.dp),
                         modifier = Modifier.wrapContentWidth()
                     ) {
                         Text(
-                            text = "${parcel.weightKg} kg",
-                            color = MaterialTheme.colorScheme.onPrimary,
-                            fontSize = 11.sp,
+                            text = statusChipText,
+                            color = statusContentColor,
+                            fontSize = 10.sp,
                             fontWeight = FontWeight.Bold,
                             maxLines = 1,
                             softWrap = false,
@@ -1520,7 +1571,7 @@ fun ParcelItemCard(
                 Spacer(modifier = Modifier.height(2.dp))
 
                 Text(
-                    text = "Customer: ${parcel.customerName} | Brand: ${parcel.brand}",
+                    text = "Customer: ${parcel.customerName} | Area: ${parcel.destinationAddress}",
                     fontSize = 12.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1
@@ -1533,24 +1584,6 @@ fun ParcelItemCard(
                     color = MaterialTheme.colorScheme.primary,
                     maxLines = 1
                 )
-
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        imageVector = if (parcel.isWithin20KmCoverage) Icons.Default.CheckCircle else Icons.Default.Warning,
-                        contentDescription = null,
-                        tint = if (parcel.isWithin20KmCoverage) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
-                        modifier = Modifier.size(12.dp)
-                    )
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text(
-                        text = if (parcel.isWithin20KmCoverage) "Inside 20km Zone (%.1f km)".format(parcel.distanceFromHubKm)
-                        else "Outside 20km Zone (%.1f km)".format(parcel.distanceFromHubKm),
-                        fontSize = 11.sp,
-                        color = if (parcel.isWithin20KmCoverage) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
-                        maxLines = 1,
-                        softWrap = false
-                    )
-                }
             }
         }
     }
@@ -1559,12 +1592,36 @@ fun ParcelItemCard(
 @Composable
 fun ParcelDetailView(
     parcel: ParcelItem,
+    shiftState: DriverShiftState?,
+    simSecondsElapsed: Int,
+    trafficFactor: Double,
     onBack: () -> Unit,
     onFocusDriverOnMap: () -> Unit
 ) {
+    val etaResult = remember(parcel.id, simSecondsElapsed, shiftState?.riderState, shiftState?.currentParcelIndex, shiftState?.routeStatus) {
+        if (shiftState != null) {
+            calculateParcelEta(parcel, shiftState, simSecondsElapsed, trafficFactor)
+        } else null
+    }
+
+    val queue = shiftState?.parcelQueue ?: emptyList()
+    val targetIndex = queue.indexOfFirst { it.id == parcel.id }
+    val currentIdx = shiftState?.currentParcelIndex ?: 0
+    val totalStops = queue.size
+    val stopNum = if (targetIndex >= 0) targetIndex + 1 else 0
+    val stopsBefore = (targetIndex - currentIdx).coerceAtLeast(0)
+
+    val activeStep = when {
+        parcel.status == DeliveryStatus.DELIVERED -> 4
+        stopsBefore <= 3 && (shiftState?.riderState == RiderState.EN_ROUTE || shiftState?.riderState == RiderState.UNLOADING) -> 3
+        shiftState?.riderState == RiderState.EN_ROUTE || shiftState?.riderState == RiderState.UNLOADING -> 2
+        else -> 1
+    }
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
+            .verticalScroll(rememberScrollState())
             .padding(8.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1572,41 +1629,98 @@ fun ParcelDetailView(
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
             }
             Text(
-                text = "Parcel Dispatch Details",
+                text = "Track My Parcel",
                 fontSize = 18.sp,
                 fontWeight = FontWeight.Bold
             )
         }
 
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(8.dp))
 
-        // Parcel Card
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(12.dp)
-        ) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                Text(
-                    text = parcel.name,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 16.sp
-                )
-                Text(text = "Customer: ${parcel.customerName}", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                Text(text = "Brand: ${parcel.brand} | Category: ${parcel.category}", fontSize = 13.sp)
-                Spacer(modifier = Modifier.height(6.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
+        // 1. Headline ETA / Status Banner Card
+        if (parcel.status == DeliveryStatus.DELIVERED) {
+            Surface(
+                color = androidx.compose.ui.graphics.Color(0xFF2E7D32),
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
                     Text(
-                        text = "Weight: ${parcel.weightKg} kg | Price: ₱%,.2f".format(parcel.pricePhp),
+                        text = "✅ Parcel Delivered",
+                        fontSize = 18.sp,
                         fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.primary
+                        color = androidx.compose.ui.graphics.Color.White
                     )
+                    Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "ID: ${parcel.id}",
-                        fontSize = 12.sp,
-                        color = MaterialTheme.colorScheme.outline
+                        text = "Delivered successfully at customer address",
+                        fontSize = 13.sp,
+                        color = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.9f)
+                    )
+                }
+            }
+        } else if (parcel.status == DeliveryStatus.SKIPPED) {
+            val skipReason = shiftState?.skippedReasons?.firstOrNull { it.contains(parcel.name) } ?: "Unreachable destination route"
+            Surface(
+                color = MaterialTheme.colorScheme.errorContainer,
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(
+                        text = "⚠️ Delivery Skipped",
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onErrorContainer
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "Reason: $skipReason",
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onErrorContainer
+                    )
+                }
+            }
+        } else if (etaResult != null) {
+            Surface(
+                color = MaterialTheme.colorScheme.primaryContainer,
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(
+                        text = "Arriving around ${etaResult.formattedArrivalTime}",
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "${etaResult.formattedRelativeMin} (Estimated)",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.85f)
+                    )
+                }
+            }
+        } else {
+            Surface(
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                shape = RoundedCornerShape(12.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(
+                        text = "Calculating...",
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "Estimating delivery route and traffic...",
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.85f)
                     )
                 }
             }
@@ -1614,7 +1728,99 @@ fun ParcelDetailView(
 
         Spacer(modifier = Modifier.height(12.dp))
 
-        // Driver Card
+        // 2. Queue Position Card
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Row(
+                modifier = Modifier.padding(14.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text(
+                        text = "Queue Position: Stop $stopNum of $totalStops",
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = if (stopsBefore == 0 && parcel.status != DeliveryStatus.DELIVERED) "Your parcel is next in queue!"
+                        else "$stopsBefore stops before yours",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        // 3. 4-Step Timeline Card
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text(
+                    text = "Delivery Status Timeline",
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+
+                val steps = listOf("At hub", "Out for delivery", "Nearby", "Delivered")
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    steps.forEachIndexed { index, title ->
+                        val stepNum = index + 1
+                        val isDoneOrActive = activeStep >= stepNum
+                        val isCurrent = activeStep == stepNum
+
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(28.dp)
+                                    .clip(CircleShape)
+                                    .background(
+                                        if (isCurrent) MaterialTheme.colorScheme.primary
+                                        else if (isDoneOrActive) MaterialTheme.colorScheme.primaryContainer
+                                        else MaterialTheme.colorScheme.surfaceVariant
+                                    ),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = "$stepNum",
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (isCurrent) MaterialTheme.colorScheme.onPrimary
+                                    else if (isDoneOrActive) MaterialTheme.colorScheme.onPrimaryContainer
+                                    else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = title,
+                                fontSize = 10.sp,
+                                fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Normal,
+                                color = if (isCurrent) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        // 4. Rider Info Card
         Card(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(12.dp),
@@ -1624,56 +1830,19 @@ fun ParcelDetailView(
         ) {
             Column(modifier = Modifier.padding(16.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.Person, contentDescription = "Driver")
+                    Icon(Icons.Default.Person, contentDescription = "Rider")
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = "Assigned Delivery Driver",
+                        text = "Assigned Delivery Rider",
                         fontWeight = FontWeight.Bold,
-                        fontSize = 15.sp
+                        fontSize = 14.sp
                     )
                 }
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(text = "Driver Name: ${parcel.assignedDriver.name} (Age: ${parcel.assignedDriver.age})", fontSize = 13.sp)
-                Text(text = "Vehicle: ${parcel.assignedDriver.vehicleName} (${parcel.assignedDriver.licensePlate})", fontSize = 13.sp)
-                Text(text = "Contact: ${parcel.assignedDriver.phone}", fontSize = 13.sp)
-                Text(text = "Vehicle Max Weight Limit: ${parcel.assignedDriver.maxWeightCapacityKg} kg", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-            }
-        }
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        // Destination & ETA Card
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(12.dp)
-        ) {
-            Column(modifier = Modifier.padding(16.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Default.Place, contentDescription = "ETA")
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = "Delivery Destination & ETA",
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 15.sp
-                    )
-                }
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(text = "Customer: ${parcel.customerName}", fontSize = 13.sp)
-                Text(text = "Address: ${parcel.destinationAddress}", fontSize = 13.sp)
                 Spacer(modifier = Modifier.height(6.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Text(
-                        text = "Distance: %.2f km".format(parcel.distanceFromHubKm),
-                        fontWeight = FontWeight.Bold
-                    )
-                    Text(
-                        text = "Est. ETA: ${parcel.estimatedTimeMinutes} mins",
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.primary
-                    )
+                Text(text = "Rider: ${parcel.assignedDriver.name}", fontSize = 13.sp)
+                Text(text = "Vehicle: ${parcel.assignedDriver.vehicleName} (${parcel.assignedDriver.vehicleType.displayName})", fontSize = 13.sp)
+                if (shiftState != null) {
+                    Text(text = "Vehicle Payload: %.1f kg / %.1f kg".format(shiftState.currentPayloadWeightKg, parcel.assignedDriver.maxWeightCapacityKg), fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                 }
             }
         }
@@ -1690,10 +1859,10 @@ fun ParcelDetailView(
                 containerColor = MaterialTheme.colorScheme.primary
             )
         ) {
-            Icon(Icons.Default.LocationOn, contentDescription = "Focus Driver")
+            Icon(Icons.Default.LocationOn, contentDescription = "Track on map")
             Spacer(modifier = Modifier.width(8.dp))
             Text(
-                text = "Focus Driver Route on Map",
+                text = "Track on Map",
                 fontWeight = FontWeight.Bold,
                 fontSize = 15.sp
             )
