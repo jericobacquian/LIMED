@@ -109,6 +109,7 @@ import com.example.weight_based_delivery_system.data.RouteFetchStatus
 import com.example.weight_based_delivery_system.data.VehicleType
 import com.example.weight_based_delivery_system.data.calculateDistanceKm
 import com.example.weight_based_delivery_system.data.calculateParcelEta
+import com.example.weight_based_delivery_system.data.describePosition
 import com.example.weight_based_delivery_system.data.getTrafficFactor
 import com.example.weight_based_delivery_system.data.interpolateAlongRoute
 import com.example.weight_based_delivery_system.data.osrmProfile
@@ -998,14 +999,23 @@ fun ActiveDriverStatusCard(
                         tint = MaterialTheme.colorScheme.onPrimaryContainer
                     )
                     Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = "${shiftState.driver.name} (${shiftState.driver.vehicleName})",
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 13.sp,
-                        color = MaterialTheme.colorScheme.onPrimaryContainer,
-                        maxLines = 1,
-                        softWrap = false
-                    )
+                    Column {
+                        Text(
+                            text = "${shiftState.driver.name} (${shiftState.driver.vehicleName})",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            maxLines = 1,
+                            softWrap = false
+                        )
+                        Text(
+                            text = shiftState.driver.getSummary(),
+                            fontSize = 10.sp,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.85f),
+                            maxLines = 1,
+                            softWrap = false
+                        )
+                    }
                 }
 
                 Surface(
@@ -1628,11 +1638,18 @@ fun ParcelDetailView(
             IconButton(onClick = onBack) {
                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
             }
-            Text(
-                text = "Track My Parcel",
-                fontSize = 18.sp,
-                fontWeight = FontWeight.Bold
-            )
+            Column {
+                Text(
+                    text = "Track My Parcel",
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    text = describePosition(parcel),
+                    fontSize = 11.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
         }
 
         Spacer(modifier = Modifier.height(8.dp))
@@ -1843,6 +1860,12 @@ fun ParcelDetailView(
                 Text(text = "Vehicle: ${parcel.assignedDriver.vehicleName} (${parcel.assignedDriver.vehicleType.displayName})", fontSize = 13.sp)
                 if (shiftState != null) {
                     Text(text = "Vehicle Payload: %.1f kg / %.1f kg".format(shiftState.currentPayloadWeightKg, parcel.assignedDriver.maxWeightCapacityKg), fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = describePosition(shiftState),
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.85f)
+                    )
                 }
             }
         }
