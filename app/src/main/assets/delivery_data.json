@@ -1,0 +1,54 @@
+{
+  "drivers": [
+    {
+      "id": "DRV-001",
+      "name": "Mark Santos",
+      "age": 24,
+      "phone": "+63 917 123 4567",
+      "licensePlate": "MC-1029-NB",
+      "vehicleType": "MOTORCYCLE",
+      "vehicleName": "Honda TMX 125 (Express)",
+      "maxWeightCapacityKg": 15.0
+    },
+    {
+      "id": "DRV-002",
+      "name": "Leo Cruz",
+      "age": 26,
+      "phone": "+63 918 234 5678",
+      "licensePlate": "MC-8832-BT",
+      "vehicleType": "MOTORCYCLE",
+      "vehicleName": "Yamaha Sight 115",
+      "maxWeightCapacityKg": 15.0
+    },
+    {
+      "id": "DRV-003",
+      "name": "Ramon Reyes",
+      "age": 35,
+      "phone": "+63 920 345 6789",
+      "licensePlate": "L300-5541-NG",
+      "vehicleType": "L300",
+      "vehicleName": "Mitsubishi L300 FB Commercial Van",
+      "maxWeightCapacityKg": 800.0
+    },
+    {
+      "id": "DRV-004",
+      "name": "Viktor Ramos",
+      "age": 38,
+      "phone": "+63 922 456 7890",
+      "licensePlate": "L300-9102-BT",
+      "vehicleType": "L300",
+      "vehicleName": "Isuzu Travis Utility Van",
+      "maxWeightCapacityKg": 800.0
+    },
+    {
+      "id": "DRV-005",
+      "name": "Eduardo Garcia",
+      "age": 46,
+      "phone": "+63 929 567 8901",
+      "licensePlate": "TRK-4491-PH",
+      "vehicleType": "TRUCK",
+      "vehicleName": "Isuzu Forward 6-Wheeler Heavy Truck",
+      "maxWeightCapacityKg": 3000.0
+    }
+  ]
+}

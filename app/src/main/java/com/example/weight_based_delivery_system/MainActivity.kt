@@ -389,11 +389,18 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
         activeSimLoopCount++
         Log.d("SimEngine", "Started simulation loop. Active loop count: $activeSimLoopCount")
 
+        var stepAccumulator = 0.0
+
         try {
             while (!isPaused) {
                 delay(100)
-                val stepSeconds = (1 * (simSpeedMultiplier / 10).coerceAtLeast(1))
-                simSecondsElapsed += stepSeconds
+                val stepSeconds = (simSpeedMultiplier * 0.1).coerceAtMost(10.0)
+                stepAccumulator += stepSeconds
+                if (stepAccumulator >= 1.0) {
+                    val wholeSecs = stepAccumulator.toInt()
+                    simSecondsElapsed += wholeSecs
+                    stepAccumulator -= wholeSecs
+                }
 
                 // Traffic Factor: 25% speed reduction during 07:30 AM - 09:00 AM Rush Hour
                 val trafficFactor = getTrafficFactor(simSecondsElapsed)
@@ -461,7 +468,7 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
                                 parcel.currentLat = parcel.destinationLat
                                 parcel.currentLng = parcel.destinationLng
 
-                                shiftState.unloadingSecondsRemaining -= (stepSeconds * (simSpeedMultiplier / 10).coerceAtLeast(1))
+                                shiftState.unloadingSecondsRemaining -= stepSeconds
                                 if (shiftState.unloadingSecondsRemaining <= 0) {
                                     parcel.status = DeliveryStatus.DELIVERED
 
