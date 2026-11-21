@@ -384,7 +384,18 @@ fun DeliveryDashboard(modifier: Modifier = Modifier) {
         }
     }
 
-    // Central 6:00 AM Real-World Simulation Engine (Speed + Unloading Delays + Traffic + Return Trip to Hub)
+    /**
+     * Purpose: Central 6:00 AM Real-World Simulation Engine tick loop executing every 100 ms.
+     * Main Steps:
+     * 1. Advance simulation clock (simSecondsElapsed) and stepAccumulator based on simSpeedMultiplier.
+     * 2. Evaluate rush-hour traffic factor (getTrafficFactor) during 07:30 AM - 09:00 AM window.
+     * 3. Iterate through active driverShiftStates to update RiderState:
+     *    - AT_HUB: Transition to EN_ROUTE when parcel is available.
+     *    - EN_ROUTE: Move rider along OSRM route geometry using interpolateAlongRoute; transition to UNLOADING on arrival.
+     *    - UNLOADING: Countdown unloadingSecondsRemaining (1.5m, 6m, 9m); mark DELIVERED when complete and advance queue.
+     *    - RETURNING: Move rider back to Nasugbu Hub; transition to SHIFT_COMPLETED on arrival.
+     * 4. Check if all riders completed shift -> auto-pause simulation engine.
+     */
     LaunchedEffect(runId, isPaused, simSpeedMultiplier, dailyDispatchParcels.size) {
         activeSimLoopCount++
         Log.d("SimEngine", "Started simulation loop. Active loop count: $activeSimLoopCount")

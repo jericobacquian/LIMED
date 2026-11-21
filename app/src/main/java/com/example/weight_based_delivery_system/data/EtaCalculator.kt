@@ -17,8 +17,9 @@ fun getTrafficFactor(simSecondsElapsed: Int): Double {
 }
 
 /**
- * Pure function to calculate estimated arrival time for a parcel.
- * Recomputed whenever clock or rider state changes.
+ * Purpose: Pure calculation function computing estimated arrival time (ETA) for customer parcel tracking.
+ * Calculates remaining active leg travel + unloading time + upcoming detour-factor leg estimates (1.4x)
+ * at effective vehicle speeds adjusted for rush-hour traffic factor. Recomputed dynamically on clock/state updates.
  */
 fun calculateParcelEta(
     targetParcel: ParcelItem,

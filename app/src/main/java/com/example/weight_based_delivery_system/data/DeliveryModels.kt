@@ -27,6 +27,14 @@ enum class DeliveryStatus {
     SKIPPED
 }
 
+/**
+ * Purpose: Defines the 5 operational shift lifecycle states for a delivery rider:
+ * - AT_HUB: Initial state waiting at the Nasugbu Hub.
+ * - EN_ROUTE: Driving along an OSRM road route to a customer destination stop.
+ * - UNLOADING: Handover in progress with customer at destination address.
+ * - RETURNING: Driving back to Nasugbu Hub after completing all assigned stops.
+ * - SHIFT_COMPLETED: Returned to Hub, shift completed.
+ */
 enum class RiderState {
     AT_HUB,
     EN_ROUTE,

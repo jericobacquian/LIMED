@@ -181,6 +181,11 @@ fun interpolateAlongRoute(route: RoadRoute, distanceTraveledMeters: Double): Lat
     return LatLng(lat, lng)
 }
 
+/**
+ * Purpose: Parses OSRM GeoJSON response strings using org.json.JSONObject.
+ * Extracts coordinates strictly from routes[0].geometry.coordinates while ignoring
+ * trailing waypoints.location arrays to prevent route loop artifacts.
+ */
 object OsrmParser {
 
     /**
@@ -220,7 +225,9 @@ object OsrmParser {
 }
 
 /**
- * Thread-safe Route Cache Manager.
+ * Purpose: Thread-safe in-memory Route Cache Manager utilizing a ConcurrentHashMap.
+ * Caches precomputed RoadRoute objects keyed by 5-decimal rounded coordinates to eliminate
+ * redundant OSRM network requests for identical start/destination points.
  */
 object RouteCacheManager {
     private val cache = ConcurrentHashMap<String, RoadRoute>()
@@ -238,7 +245,9 @@ object RouteCacheManager {
 }
 
 /**
- * Thread-Safe Rate-Limited Request Queue using Mutex, spacing OSRM API calls 1000ms apart serially.
+ * Purpose: Thread-safe Rate-Limited Request Queue using a Kotlin Coroutine Mutex.
+ * Serially spaces OSRM HTTP API network requests at least 1,000 ms apart to prevent
+ * server-side rate limiting or HTTP 429 / 403 blocks.
  */
 object OsrmRequestQueue {
     private val mutex = Mutex()
